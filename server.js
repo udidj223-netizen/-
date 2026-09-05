@@ -822,8 +822,49 @@ async function findUserByReferralCode(env, code) {
 // ───────── إعدادات كل شركة إعلانات على حدة ─────────
 // تُقرأ من Firebase تحت config/adCompanies/<company>/{reward, dailyLimit}
 // ولو مش موجودة، بترجع للقيم الاحتياطية config/adReward و config/adCompanyDailyLimit.
+//
+// ملاحظة مهمة (إصلاح مشكلة "monetag" اللي كانت بتفضل تاخد قيمة افتراضية
+// 200 مهما غيّرت الإعدادات): سبب المشكلة كان إن نود الشركة في Firebase
+// كان مكتوب بالغلط "montag" بدل "monetag"، فالكود كان بيدور بالظبط على
+// المفتاح "monetag" ومبيلاقيهوش، فيرجع تلقائيًا للقيمة الاحتياطية جوه
+// الكود. عشان المشكلة دي متتكررش تاني مع أي خطأ إملائي أو اختلاف حالة
+// أحرف (case) في اسم النود، الدالة بقت بتدور بمرونة أكتر:
+//   1) المفتاح الصحيح بالظبط (company).
+//   2) أي alias معروف للشركة دي (زي "montag" كـ alias قديم لـ "monetag").
+//   3) مطابقة غير حساسة لحالة الأحرف/المسافات الزايدة مع كل مفاتيح
+//      config.adCompanies الموجودة فعليًا في Firebase.
+// لو حابب تضيف شركة إعلانات جديدة، أضف اسمها في COMPANY_ALIASES تحت.
+const COMPANY_ALIASES = {
+  monetag: ['monetag', 'montag'], // "montag" كان الخطأ الإملائي اللي سبب المشكلة
+  adsgram: ['adsgram'],
+};
+
+function findCompanyNode(adCompanies, company) {
+  if (!adCompanies) return {};
+  // 1) تطابق مباشر بالاسم الصحيح
+  if (adCompanies[company]) return adCompanies[company];
+
+  const aliases = COMPANY_ALIASES[company] || [company];
+
+  // 2) تطابق مع أي alias معروف (بالاسم بالظبط)
+  for (const alias of aliases) {
+    if (adCompanies[alias]) return adCompanies[alias];
+  }
+
+  // 3) تطابق غير حساس لحالة الأحرف/المسافات الزايدة، سواء مع الاسم
+  //    الأساسي أو مع أي alias، ضد كل المفاتيح الموجودة فعليًا في Firebase
+  const normalizedTargets = aliases.map(a => a.trim().toLowerCase());
+  for (const key of Object.keys(adCompanies)) {
+    if (normalizedTargets.includes(key.trim().toLowerCase())) {
+      return adCompanies[key];
+    }
+  }
+
+  return {};
+}
+
 function getAdCompanyConfig(config, company) {
-  const perCompany = (config.adCompanies && config.adCompanies[company]) || {};
+  const perCompany = findCompanyNode(config.adCompanies, company);
   const reward = Number(
     perCompany.reward ?? config.adReward ?? DEFAULT_CONFIG.adReward
   );
@@ -834,10 +875,14 @@ function getAdCompanyConfig(config, company) {
 }
 
 // يرجّع إعدادات كل الشركات المعروفة (مفيد لعرضها في الواجهة/لوحة التحكم)
+// ملاحظة: بنستخدم الأسماء "الصحيحة" فقط (من DEFAULT_CONFIG.adCompanies و
+// COMPANY_ALIASES) عشان أي نود بالغلط الإملائي زي "montag" ميظهرش كشركة
+// مستقلة تكرارية جنب "monetag" — findCompanyNode أصلاً هيلاقي بياناته
+// تلقائيًا تحت الاسم الصحيح.
 function getAllAdCompaniesConfig(config) {
   const known = new Set([
     ...Object.keys(DEFAULT_CONFIG.adCompanies || {}),
-    ...Object.keys(config.adCompanies || {}),
+    ...Object.keys(COMPANY_ALIASES || {}),
   ]);
   const result = {};
   for (const company of known) {
