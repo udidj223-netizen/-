@@ -173,6 +173,23 @@ const AF_FRAUD_SCORE_WARN        = 40;
 // الجهاز لا يُحظر تلقائيًا أبدًا ويبقى مستثنى دائمًا (انظر firstOwner).
 const AF_MAX_ACCOUNTS_PER_DEVICE = 1;
 
+// ── ملحوظة مهمة (تحديث بعد رصد حظر خطأ كتير) ─────────────────────────
+// اتضح إن الـ fingerprint المُجمَّع (canvas+webgl+hardware+fonts+audio)
+// بيطلع *متطابق حرفيًا* بين أجهزة حقيقية مختلفة تمامًا لما تكون شغالة
+// جوه Telegram WebView — لأن كل الإشارات دي بتتحسب سوفتوير بحت من نفس
+// موديل الموبايل + نفس نسخة النظام + نفس نسخة تطبيق تليجرام، من غير أي
+// اعتماد على اختلافات هاردوير حقيقية زي المتصفحات العادية. يعني ملايين
+// المستخدمين اللي عندهم نفس موديل الموبايل الشائع ممكن يطلعلهم نفس الـ
+// fingerprint بالظبط، رغم إنهم بني آدمين مختلفين تمامًا.
+// عشان كده الـ fingerprint وحده بقى مش كافي يبني عليه حظر دائم فوري —
+// لو الـ fingerprint ده ظهر مرتبط بعدد حسابات كبير قبل كده (أكتر من
+// AF_FP_COMMON_THRESHOLD)، بقى واضح إنه "بصمة شائعة" (بيئة مش جهاز
+// مميز)، فمنوقف الاعتماد عليه في الحظر التلقائي ونكتفي بتسجيله للمراجعة.
+// أما الـ deviceId (المعرف العشوائي المخزَّن محليًا) فلسه أقوى دليل لأنه
+// UUID عشوائي حقيقي مالوش علاقة ببيئة السوفتوير، فاحتمال تطابقه بين
+// جهازين مختلفين شبه معدوم — لسه بيتعامل معاه كدليل حظر فوري.
+const AF_FP_COMMON_THRESHOLD = 4;
+
 const AF_WEIGHTS = {
   fingerprintReused:   35,
   deviceIdReused:      30,
@@ -200,13 +217,40 @@ function afCalcScore(flags) {
 
 function afBuildReason(flags) {
   const parts = [];
-  if (flags.fingerprintReused)  parts.push('نفس بصمة الجهاز');
   if (flags.deviceIdReused)     parts.push('نفس معرف الجهاز');
+  if (flags.fingerprintReused)  parts.push('نفس بصمة الجهاز');
   if (flags.rapidAccountCreate) parts.push('إنشاء حسابات متعددة بسرعة');
   if (flags.headlessBrowser)    parts.push('متصفح headless');
   if (flags.emulatorDetected)   parts.push('emulator مشتبه');
   if (flags.sameIpManyAccounts) parts.push('عدة حسابات من نفس الشبكة');
   return parts.length ? parts.join(' | ') : 'نشاط مشبوه';
+}
+
+// جامع الحسابات المرتبطة بنفس الجهاز (لعرضها في صفحة الحظر بالواجهة).
+// بيقرأ device_links/{fp} و device_id_map/{did}.tids، يستثني الحساب
+// الحالي، ويجيب بيانات العرض (الاسم/اليوزر/الصورة) من users/{id}.
+async function afGetLinkedAccounts(env, fp, did, excludeTid, maxCount = 10) {
+  const tids = new Set();
+  try {
+    if (fp) {
+      const links = await dbGet(env, `device_links/${fp}`);
+      if (links) Object.keys(links).forEach((t) => tids.add(t));
+    }
+    if (did) {
+      const didRecord = await dbGet(env, `device_id_map/${did}`);
+      if (didRecord && Array.isArray(didRecord.tids)) didRecord.tids.forEach((t) => tids.add(String(t)));
+    }
+  } catch (_) {}
+  tids.delete(String(excludeTid));
+
+  const ids = Array.from(tids).slice(0, maxCount);
+  if (!ids.length) return [];
+
+  const users = await Promise.all(ids.map((id) => dbGet(env, `users/${id}`).catch(() => null)));
+  return ids.map((id, i) => {
+    const u = users[i] || {};
+    return { name: u.firstName || u.username || 'Unknown', username: u.username || '', photoUrl: u.photoUrl || '' };
+  });
 }
 
 async function checkAntiFraud(env, request, telegramId, body) {
@@ -216,6 +260,10 @@ async function checkAntiFraud(env, request, telegramId, body) {
   const rawFP  = body._deviceFingerprint || null;
   const rawDID = body._deviceId          || null;
   const suspFlags = body._suspiciousFlags || {};
+  // NEW: بصمات كل إشارة لوحدها (من نسخة الواجهة المحدَّثة) — بتتخزن مع
+  // سجل الجهاز فقط لأغراض المراجعة/التصحيح لاحقًا، ومش بتُستخدم حاليًا
+  // في قرار الحظر نفسه.
+  const signals = (body._signals && typeof body._signals === 'object') ? body._signals : null;
   const fp  = afSanitiseKey(rawFP,  64);
   const did = afSanitiseKey(rawDID, 64);
 
@@ -236,6 +284,10 @@ async function checkAntiFraud(env, request, telegramId, body) {
     deviceIdReused:       false,
     rapidAccountCreate:   false,
     sameIpManyAccounts:   false,
+    // إعلامي فقط — مالوش وزن في afCalcScore ومش بيدخل في قرار الحظر أبدًا.
+    // بيتسجّل في fraud_logs بس عشان الأدمن يقدر يلاحظ لو بصمة معينة بقت
+    // شائعة جدًا (يبقى مؤشر إن فيه حاجة غلط في جودة الـ fingerprint نفسه).
+    fingerprintCommonEnvironment: false,
   };
 
   let firstOwner = null;
@@ -249,6 +301,7 @@ async function checkAntiFraud(env, request, telegramId, body) {
         await dbSet(env, `devices/${fp}`, {
           firstSeenAt: nowMs, firstTelegramId: tid,
           fingerprint: fp, deviceId: did || '', ip, ua, count: 1,
+          signals: signals || null,
         });
       } else {
         firstOwner = String(deviceRecord.firstTelegramId);
@@ -267,9 +320,19 @@ async function checkAntiFraud(env, request, telegramId, body) {
       const countBefore = allLinksBefore ? Object.keys(allLinksBefore).length : 0;
 
       if (!existingLink) {
-        // لو عدد الحسابات الحالي فعلاً وصل أو تعدى الحد المسموح، الحساب الجديد يُحظر
+        // لو عدد الحسابات الحالي فعلاً وصل أو تعدى الحد المسموح...
         if (countBefore >= AF_MAX_ACCOUNTS_PER_DEVICE) {
-          flags.fingerprintReused = true;
+          // ...لكن قبل ما نعتبرها حالة تعدد حسابات حقيقية، لازم نتأكد إن
+          // البصمة دي "مميزة" فعلاً. لو نفس الـ fp ده سبق وارتبط بعدد كبير
+          // من الحسابات المختلفة (>= AF_FP_COMMON_THRESHOLD)، ده مش دليل
+          // على شخص واحد بيعمل حسابات كتير — ده أقرب لبصمة بيئة شائعة
+          // (نفس موديل موبايل منتشر) بتتكرر بين ناس حقيقيين مختلفين.
+          // في الحالة دي منوقّفش المستخدم، بس نسجّلها للمراجعة فقط.
+          if (countBefore >= AF_FP_COMMON_THRESHOLD) {
+            flags.fingerprintCommonEnvironment = true;
+          } else {
+            flags.fingerprintReused = true;
+          }
         }
         await dbSet(env, linkPath, {
           telegramId: tid, seenAt: nowMs, ip, deviceId: did || '',
@@ -332,23 +395,50 @@ async function checkAntiFraud(env, request, telegramId, body) {
         ip, ts: nowMs, reason: afBuildReason(flags), score, flags,
       });
     } catch (_) {}
+  } else if (flags.fingerprintCommonEnvironment) {
+    // بيسجل حتى لو الدرجة صفر (الوزن = 0 عمدًا) — عشان الأدمن يقدر يراجع
+    // دوريًا أي fingerprint بقى "شائع" جدًا ويرفع/يخفض AF_FP_COMMON_THRESHOLD
+    // بناءً على بيانات حقيقية بدل تخمين.
+    try {
+      await dbPush(env, 'fraud_logs_common_fp', {
+        telegramId: tid, fingerprint: fp, ip, ts: nowMs,
+      });
+    } catch (_) {}
   }
 
-  // ── قرار الحظر: يعتمد فقط على تكرار بصمة الجهاز/معرف الجهاز ──────
-  // (وليس على الـIP أو أي إشارة أخرى) حتى لا يُحظر مستخدم بريء بسبب
-  // شبكة مشتركة، ولا يستطيع مستخدم متعدد الحسابات تجاوز الحظر بمجرد
-  // تغيير الـIP الخاص به. متى تم اكتشاف نفس الجهاز مرتبطًا بأكثر من
-  // حساب، يُحظر الحساب الجديد فورًا مع الإبقاء على الحساب الأول كما هو.
-  if (flags.fingerprintReused || flags.deviceIdReused) {
+  // ── قرار الحظر (مُعاد تصميمه لتقليل الحظر الخطأ) ─────────────────
+  // deviceId (UUID عشوائي مخزَّن محليًا) دليل قوي وموثوق — تطابقه بين
+  // حسابين مختلفين شبه مستحيل يحصل صدفة، فبيفضل يُحظر فورًا زي الأول.
+  //
+  // fingerprint (بصمة الجهاز المُجمَّعة) بقى أقل موثوقية جوه Telegram
+  // WebView (راجع تعليق AF_FP_COMMON_THRESHOLD فوق)، فبقى وحده مش كافي
+  // للحظر الفوري — لازم يتأكد بإشارة تانية توصل بالدرجة الكلية لحد
+  // AF_FRAUD_SCORE_BLOCK. لو مطابقة فقط من غير أي دليل إضافي، بيتسجل
+  // في fraud_logs ومكافآت الإحالة بتتوقف مؤقتًا، لكن الحساب نفسه
+  // مايتقفلش بشكل نهائي غلط.
+  const hardBlock = flags.deviceIdReused;
+  const corroboratedFpBlock = flags.fingerprintReused && score >= AF_FRAUD_SCORE_BLOCK;
+
+  if (hardBlock || corroboratedFpBlock) {
     const reason = 'تم اكتشاف استخدام أكثر من حساب على نفس الجهاز. الحساب الأول المُنشأ على هذا الجهاز فقط هو المسموح باستخدام البوت.';
     try {
       await dbUpdate(env, `blocked_accounts/${tid}`, {
         reason, reasonCode: 'multi_account', score, ts: nowMs,
         firstOwner: firstOwner || 'unknown',
+        fingerprint: fp || null, deviceId: did || null,
         flags,
       });
     } catch (_) {}
-    return { blocked: true, referralBlocked: true, reason, reasonCode: 'multi_account', score };
+    let linkedAccounts = [];
+    try { linkedAccounts = await afGetLinkedAccounts(env, fp, did, tid); } catch (_) {}
+    return { blocked: true, referralBlocked: true, reason, reasonCode: 'multi_account', score, linkedAccounts };
+  }
+
+  // مطابقة fingerprint وحدها من غير ما توصل لدرجة الحظر: نوقف مكافآت
+  // الإحالة بس كإجراء احترازي، من غير ما نمنع الحساب نفسه من استخدام
+  // البوت — لحد ما يتأكد بدليل إضافي أو يراجعها الأدمن يدويًا.
+  if (flags.fingerprintReused) {
+    return { blocked: false, referralBlocked: true, reason: 'تم رصد نشاط مشتبه، مكافآت الإحالة موقوفة مؤقتًا لحين المراجعة', reasonCode: 'fingerprint_review', score };
   }
 
   return { blocked: false, referralBlocked: false, score };
@@ -401,12 +491,13 @@ function failCaptcha(error) {
 
 // رد خاص لحساب محظور — الواجهة الأمامية تتعرف على blocked:true فتعرض
 // صفحة الحظر المخصصة (Ban Screen) بدلاً من التطبيق الرئيسي، مع سبب الحظر.
-function failBlocked(reason, reasonCode) {
+function failBlocked(reason, reasonCode, linkedAccounts) {
   return json({
     success: false,
     error: reason || 'هذا الحساب محظور من استخدام البوت',
     blocked: true,
     reasonCode: reasonCode || 'blocked',
+    linkedAccounts: Array.isArray(linkedAccounts) ? linkedAccounts : [],
     serverTime: Date.now(),
   }, 403);
 }
@@ -2546,7 +2637,11 @@ async function handleFetch(request, env) {
       try {
         const accountBlocked = await dbGet(env, `blocked_accounts/${user.telegramId}`);
         if (accountBlocked) {
-          return failBlocked(accountBlocked.reason, accountBlocked.reasonCode);
+          let linkedAccounts = [];
+          try {
+            linkedAccounts = await afGetLinkedAccounts(env, accountBlocked.fingerprint, accountBlocked.deviceId, user.telegramId);
+          } catch (_) {}
+          return failBlocked(accountBlocked.reason, accountBlocked.reasonCode, linkedAccounts);
         }
       } catch (_) {}
       // ─────────────────────────────────────────────────────────────
@@ -2554,7 +2649,7 @@ async function handleFetch(request, env) {
       // ── طبقة الحماية ضد الاحتيال (تعدد الحسابات عبر بصمة الجهاز) ──
       const fraudResult = await checkAntiFraud(env, request, user.telegramId, body);
       if (fraudResult.blocked) {
-        return failBlocked(fraudResult.reason, fraudResult.reasonCode);
+        return failBlocked(fraudResult.reason, fraudResult.reasonCode, fraudResult.linkedAccounts);
       }
       // ─────────────────────────────────────────────────────────────
 
