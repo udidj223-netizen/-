@@ -52,8 +52,7 @@ if (typeof globalThis.crypto === 'undefined') {
 // ──────────────────────────────────────────────────────────────────────
 const DEFAULT_CONFIG = {
   botUsername: 'Pmt_Gram_Bot',
-  referralReward: 4000,        // Daily referral reward after watching 10 ads
-  referralPayoutDays: 3,       // عدد الأيام اللي تُدفع فيها مكافأة الإحالة (بدل 3 ثابتة)
+  referralReward: 4000,        // مكافأة الإحالة (تُصرف مرة واحدة فقط بعد مشاهدة 10 إعلانات)
   comboReward: 5000,           // مكافأة الكومبو اليومي (SHIBA)
   taskDefaultReward: 500,      // مكافأة افتراضية لمهام القنوات/البوتات
   dailyBonusReward: 500,       // المكافأة اليومية
@@ -89,6 +88,16 @@ const DEFAULT_CONFIG = {
   pricePer100MembersTon: 0.15, // سعر كل 100 عضو مطلوب في "ترويج القناة" بعملة TON
   pricePer100MembersShiba: 200000,
   pricePer100MembersUsd: 1,
+
+  // ═══════ تصنيف الإحالات الأسبوعي (Weekly Referral Contest) ═══════
+  // مدة كل مسابقة أسبوعية بالمللي ثانية — الافتراضي 7 أيام بالظبط.
+  // قابلة للتعديل من Firebase تحت config/weeklyContestDurationMs لو
+  // حبيت تخليها مدة مختلفة (تجريبيًا مثلًا).
+  weeklyContestDurationMs: 7 * 24 * 60 * 60 * 1000,
+  // جوائز المراكز من 1 إلى 10 بعملة TON بالترتيب — مجموعها = 3 TON بالظبط
+  // (1 + 0.5 + 0.5 + 0.25 + 0.25 + 0.1×5). قابلة للتعديل بالكامل من
+  // Firebase تحت config/weeklyContestPrizesTon (لازم تفضل 10 عناصر بالظبط).
+  weeklyContestPrizesTon: [1, 0.5, 0.5, 0.25, 0.25, 0.1, 0.1, 0.1, 0.1, 0.1],
 };
 
 // عنوان محفظة الإيداع مأخوذ من نظام الإيداع العامل (server 58).
@@ -120,7 +129,7 @@ const COMBO_EMOJI_POOL = ['🦴', '🏠', '🎾', '🍖'];
 // فبدلاً من التحقق الحقيقي، نفرض فترة انتظار حقيقية بعد فتح رابط
 // البوت (مُسجَّلة من السيرفر، وليست مجرد مؤقّت في الواجهة يمكن تجاوزه)
 // قبل السماح للمستخدم بالضغط على Verify واستلام المكافأة ─────
-const BOT_TASK_WAIT_SECONDS = 3;
+const BOT_TASK_WAIT_SECONDS = 15;
 
 // ───────── عجلة الحظ (Lucky Wheel) — 8 قطاعات بالترتيب المعروض في الواجهة،
 // كل قطاع له "وزن" (weight) يحدد احتمالية الفوز به (الأوزان الأكبر = احتمال
@@ -157,7 +166,12 @@ const usedInitDataHashes = new Map();  // hash -> expireAt (replay protection)
 // ════════════════════════════════════════════════════════════════════
 const AF_FRAUD_SCORE_BLOCK       = 70;
 const AF_FRAUD_SCORE_WARN        = 40;
-const AF_MAX_ACCOUNTS_PER_DEVICE = 5;
+// ── حماية تعدد الحسابات (Multi-Account Protection) ──────────────────
+// جهاز واحد = حساب واحد فقط. أي حساب إضافي يُنشأ من نفس الجهاز (سواء عبر
+// نفس بصمة الجهاز Device Fingerprint أو نفس معرف الجهاز المخزَّن محليًا)
+// يُحظر فورًا، بصرف النظر عن الـIP المستخدم. الحساب الأول الذي أُنشئ على
+// الجهاز لا يُحظر تلقائيًا أبدًا ويبقى مستثنى دائمًا (انظر firstOwner).
+const AF_MAX_ACCOUNTS_PER_DEVICE = 1;
 
 const AF_WEIGHTS = {
   fingerprintReused:   35,
@@ -320,14 +334,21 @@ async function checkAntiFraud(env, request, telegramId, body) {
     } catch (_) {}
   }
 
-  if (score >= AF_FRAUD_SCORE_BLOCK || flags.fingerprintReused || flags.deviceIdReused) {
+  // ── قرار الحظر: يعتمد فقط على تكرار بصمة الجهاز/معرف الجهاز ──────
+  // (وليس على الـIP أو أي إشارة أخرى) حتى لا يُحظر مستخدم بريء بسبب
+  // شبكة مشتركة، ولا يستطيع مستخدم متعدد الحسابات تجاوز الحظر بمجرد
+  // تغيير الـIP الخاص به. متى تم اكتشاف نفس الجهاز مرتبطًا بأكثر من
+  // حساب، يُحظر الحساب الجديد فورًا مع الإبقاء على الحساب الأول كما هو.
+  if (flags.fingerprintReused || flags.deviceIdReused) {
+    const reason = 'تم اكتشاف استخدام أكثر من حساب على نفس الجهاز. الحساب الأول المُنشأ على هذا الجهاز فقط هو المسموح باستخدام البوت.';
     try {
       await dbUpdate(env, `blocked_accounts/${tid}`, {
-        reason: afBuildReason(flags), score, ts: nowMs,
+        reason, reasonCode: 'multi_account', score, ts: nowMs,
         firstOwner: firstOwner || 'unknown',
+        flags,
       });
     } catch (_) {}
-    return { blocked: false, referralBlocked: true, reason: afBuildReason(flags), score };
+    return { blocked: true, referralBlocked: true, reason, reasonCode: 'multi_account', score };
   }
 
   return { blocked: false, referralBlocked: false, score };
@@ -337,7 +358,7 @@ async function isReferralEligible(env, newUserTelegramId) {
   try {
     const tid = String(newUserTelegramId);
     const blocked = await dbGet(env, `blocked_accounts/${tid}`);
-    if (blocked) return { eligible: false, reason: blocked.reason || 'جهاز محظور' };
+    if (blocked) return { eligible: false, reason: blocked.reason || 'جهاز محظور', reasonCode: blocked.reasonCode };
   } catch (_) {}
   return { eligible: true };
 }
@@ -376,6 +397,18 @@ function fail(error, status = 400) {
 // قبل إعادة المحاولة (الواجهة تتعرف على requiresCaptcha:true وتفتح النافذة).
 function failCaptcha(error) {
   return json({ success: false, error, requiresCaptcha: true, serverTime: Date.now() }, 400);
+}
+
+// رد خاص لحساب محظور — الواجهة الأمامية تتعرف على blocked:true فتعرض
+// صفحة الحظر المخصصة (Ban Screen) بدلاً من التطبيق الرئيسي، مع سبب الحظر.
+function failBlocked(reason, reasonCode) {
+  return json({
+    success: false,
+    error: reason || 'هذا الحساب محظور من استخدام البوت',
+    blocked: true,
+    reasonCode: reasonCode || 'blocked',
+    serverTime: Date.now(),
+  }, 403);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -768,8 +801,9 @@ async function registerReferralIfNeeded(env, user, startParam, config) {
     const existingRef = await dbGet(env, `referrals/${referrerId}/${telegramId}`);
     if (!existingRef) {
       const reward = config.referralReward ?? DEFAULT_CONFIG.referralReward;
-      const payoutDays = getReferralPayoutDays(config);
-      // تُسجّل الإحالة pending وتتحول إلى active بعد استيفاء شروط التفعيل.
+      // تُسجّل الإحالة pending وتتحول إلى completed مباشرة بعد استيفاء
+      // شروط التفعيل (مشاهدة 10 إعلانات) — المكافأة تُصرف مرة واحدة فقط،
+      // بدون أي تقسيم على عدة أيام.
       await dbSet(env, `referrals/${referrerId}/${telegramId}`, {
         telegramId,
         firstName: user.firstName,
@@ -780,7 +814,7 @@ async function registerReferralIfNeeded(env, user, startParam, config) {
         status: 'pending',
       });
       await sendTelegramMessage(env, config.botToken || '', referrerId,
-        `👥 New referral joined!\n\n👤 ${user.firstName || user.username || 'A user'} opened Pmt Gram with your link.\n\n⏳ They need to watch 10 ads before you get paid.\n💎 Your reward: +${Number(reward).toLocaleString('en-US')} PMT each day for ${payoutDays} day${payoutDays === 1 ? '' : 's'}`);
+        `👥 New referral joined!\n\n👤 ${user.firstName || user.username || 'A user'} opened Pmt Gram with your link.\n\n⏳ They need to watch 10 ads before you get paid.\n💎 Your reward: +${Number(reward).toLocaleString('en-US')} PMT — credited once, as soon as they finish`);
     }
 
     user.referredBy = referrerId;
@@ -926,7 +960,8 @@ async function addBalanceLog(env, telegramId, logEntry) {
   if (Number(logEntry.amount || 0) > 0 &&
        logEntry.type !== 'referral_reward' &&
        logEntry.type !== 'referral_daily_reward' &&
-      logEntry.type !== 'referral_commission') {
+       logEntry.type !== 'referral_commission' &&
+      logEntry.type !== 'weekly_referral_contest_prize') {
     try {
       const referredUser = await dbGet(env, `users/${telegramId}`);
       const referrerId = referredUser?.referredBy;
@@ -935,7 +970,10 @@ async function addBalanceLog(env, telegramId, logEntry) {
         : null;
       const blocked = await dbGet(env, `blocked_accounts/${telegramId}`);
       const commission = Math.floor(Number(logEntry.amount) * 0.10);
-      if (referrerId && referral?.status === 'active' &&
+      // العمولة 10% تُستحق بمجرد اكتمال (تفعيل) الإحالة — أي بعد صرف
+      // مكافأة الإحالة الفردية (status === 'completed'). النظام القديم
+      // القائم على 3 أيام (status === 'active') لم يعد له وجود.
+      if (referrerId && referral?.status === 'completed' &&
           Number(referredUser?.totalAdsWatched || 0) >= 10 &&
           !blocked && commission > 0) {
         await incrementBalance(env, referrerId, commission);
@@ -971,40 +1009,9 @@ async function sendTelegramMessage(env, botToken, chatId, text) {
   } catch (_) {}
 }
 
-function cairoDayNumber(dateKey) {
-  const [y, m, d] = String(dateKey).split('-').map(Number);
-  return Date.UTC(y, (m || 1) - 1, d || 1) / 86400000;
-}
-
-// عدد الأيام اللي بتتدفع فيها مكافأة الإحالة (افتراضيًا 3 أيام) - قابل
-// للتعديل بالكامل من Firebase تحت config/referralPayoutDays
-function getReferralPayoutDays(config) {
-  const n = Math.floor(Number(config?.referralPayoutDays ?? DEFAULT_CONFIG.referralPayoutDays));
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_CONFIG.referralPayoutDays;
-}
-
-function referralDayIndex(joinedAt, today, payoutDays = 3) {
-  const joined = todayKeyCairoFromTimestamp(joinedAt || Date.now());
-  return Math.min(payoutDays, Math.max(1, cairoDayNumber(today) - cairoDayNumber(joined) + 1));
-}
-
-function referralDays(refRecord, referredUser, today, payoutDays = 3) {
-  const saved = refRecord?.dailyRewards || {};
-  const currentDay = referralDayIndex(refRecord?.joinedAt, today, payoutDays);
-  const adsToday = referredUser?.adWatchDate === today
-    ? Number(referredUser?.adsWatchedToday || 0) : 0;
-  const days = [];
-  for (let day = 1; day <= payoutDays; day++) days.push(day);
-  return days.map((day) => ({
-    day,
-    adsWatched: saved[`day${day}`]?.adsWatched || (day === currentDay ? adsToday : 0),
-    adsRequired: 10,
-    claimed: !!saved[`day${day}`]?.claimed,
-    reward: Number(saved[`day${day}`]?.reward || 0),
-  }));
-}
-
-// مكافأة الإحالة اليومية: 10 إعلانات في كل يوم، لمدة 3 أيام.
+// مكافأة الإحالة: نظام يوم واحد فقط. بمجرد ما المُحال يشوف 10 إعلانات
+// (في أي يوم)، تُصرف مكافأة الإحالة للمُحيل مباشرة ومرة واحدة فقط —
+// لا يوجد أي تقسيم للمكافأة على عدة أيام بعد الآن.
 async function activateReferralIfNeeded(env, telegramId, config, botToken) {
   const logActivation = async (extra) => {
     try {
@@ -1027,17 +1034,21 @@ async function activateReferralIfNeeded(env, telegramId, config, botToken) {
     return;
   }
 
-  const today = todayKeyCairo();
-  const payoutDays = getReferralPayoutDays(config);
-  const day = referralDayIndex(refRecord.joinedAt, today, payoutDays);
-  const dailyRewards = { ...(refRecord.dailyRewards || {}) };
-  // ترحيل الإحالات القديمة التي حصلت على المكافأة القديمة مرة واحدة:
-  // نعتبر المكافأة القديمة هي Day 1 حتى لا تُدفع مرتين.
-  if (!refRecord.dailyRewards && refRecord.status === 'active') {
-    dailyRewards.day1 = { claimed: true, adsWatched: 10, reward: Number(refRecord.reward || 0), legacy: true };
+  // ── منع الاستغلال (Anti-Abuse) — الخط الأول: مكافأة الإحالة تُصرف
+  // مرة واحدة فقط لكل إحالة مدى الحياة. أي إحالة وصلت لحالة 'completed'
+  // (سواء من النظام الجديد، أو من نظام الـ3 أيام القديم بعد اكتمال آخر
+  // يوم فيه) تتوقف هنا فورًا ولا تُعاد معالجتها إطلاقًا. ──────────────
+  if (refRecord.status === 'completed') {
+    await logActivation({ result: 'already_claimed' });
+    return;
   }
+
+  const today = todayKeyCairo();
   const watched = user.adWatchDate === today ? Number(user.adsWatchedToday || 0) : 0;
-  if (watched < 10 || dailyRewards[`day${day}`]?.claimed) return;
+  if (watched < 10) {
+    await logActivation({ result: 'not_enough_ads_yet', watched });
+    return;
+  }
 
   // ── فحص أهلية مكافأة الإحالة (Anti-Fraud) ──────────────────────
   const refEligibility = await isReferralEligible(env, telegramId);
@@ -1053,27 +1064,36 @@ async function activateReferralIfNeeded(env, telegramId, config, botToken) {
     return;
   }
   // ─────────────────────────────────────────────────────────────────
-  const reward = Number(refRecord.reward ?? config.referralReward ?? DEFAULT_CONFIG.referralReward);
-  dailyRewards[`day${day}`] = { claimed: true, adsWatched: watched, reward, date: today, claimedAt: Date.now() };
-  const completed = [1, 2, 3].every((n) => dailyRewards[`day${n}`]?.claimed);
+
+  // ── منع الاستغلال — الخط الثاني: نعيد قراءة السجل مباشرة قبل الكتابة
+  // ونحدّثه لحالة 'completed' فورًا قبل إضافة الرصيد، عشان نقلّل أقصى
+  // ما يمكن نافذة أي طلبين متزامنين (race condition) يحاولان صرف نفس
+  // المكافأة مرتين في نفس اللحظة. ──────────────────────────────────
+  const freshRecord = await dbGet(env, `referrals/${referrerId}/${telegramId}`);
+  if (!freshRecord || freshRecord.status === 'completed') {
+    await logActivation({ result: 'already_claimed_race', referrerId });
+    return;
+  }
+  const reward = Number(freshRecord.reward ?? config.referralReward ?? DEFAULT_CONFIG.referralReward);
   await dbUpdate(env, `referrals/${referrerId}/${telegramId}`, {
-    dailyRewards, status: completed ? 'completed' : 'active',
-    activatedAt: refRecord.activatedAt || Date.now(), lastRewardAt: Date.now(),
+    status: 'completed',
+    adsWatchedAtClaim: watched,
+    activatedAt: Date.now(),
+    claimedAt: Date.now(),
+    rewardPaid: reward,
   });
+
   const newBalance = await incrementBalance(env, referrerId, reward);
   await addBalanceLog(env, referrerId, {
-    type: 'referral_daily_reward',
+    type: 'referral_reward',
     amount: reward,
     relatedUser: telegramId,
-    day,
     ts: Date.now(),
   });
   const referralName = user.firstName || user.username || 'Your referral';
-  const activationMessage = day === 1
-    ? `🎉 Referral activated!\n\n👤 ${referralName} watched 10 ads and is now active.\n\n💎 +${reward.toLocaleString('en-US')} PMT credited 💰 Balance: ${Number(newBalance || 0).toLocaleString('en-US')} PMT\n\n📈 You also earn 10% of everything they make, forever.`
-    : `🎉 Referral day ${day} completed!\n\n👤 ${referralName} watched 10 ads.\n\n💎 +${reward.toLocaleString('en-US')} PMT credited 💰 Balance: ${Number(newBalance || 0).toLocaleString('en-US')} PMT\n\n📈 You also earn 10% of everything they make, forever.`;
+  const activationMessage = `🎉 Referral activated!\n\n👤 ${referralName} watched 10 ads and is now active.\n\n💎 +${reward.toLocaleString('en-US')} PMT credited 💰 Balance: ${Number(newBalance || 0).toLocaleString('en-US')} PMT\n\n📈 You also earn 10% of everything they make, forever.`;
   await sendTelegramMessage(env, botToken, referrerId, activationMessage);
-  await logActivation({ result: 'daily_reward_credited', referrerId, day, reward });
+  await logActivation({ result: 'reward_credited', referrerId, reward });
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1285,8 +1305,11 @@ async function handleGetState(env, ctx) {
 
   const completedTasks = completedRaw ? Object.keys(completedRaw) : [];
 
-  // status غير موجودة (سجلات قديمة من قبل هذا التحديث) = تُعتبر "active"
-  // تلقائيًا لأنها كانت بالفعل اكتسبت مكافأتها تحت المنطق القديم
+  // نظام يوم واحد فقط: كل إحالة إما 'pending' (لسه ما شافتش 10 إعلانات)
+  // أو 'completed' (اتصرفت مكافأتها بالكامل مرة واحدة). سجلات قديمة من
+  // نظام الـ3 أيام السابق ممكن يكون عندها status = 'active' لو كانت
+  // لسه مادفعتش كل الأيام — دي بتتعامل هنا كـ 'completed' لأن مكافأتها
+  // اتصرفت بالفعل (جزئيًا على الأقل) تحت المنطق القديم.
   const referrals = referralsRaw
     ? await Promise.all(Object.entries(referralsRaw).map(async ([id, r]) => {
         const [referredUser, blocked, referredLogs] = await Promise.all([
@@ -1304,18 +1327,13 @@ async function handleGetState(env, ctx) {
               .filter((l) => l.type === 'referral_commission' && String(l.relatedUser) === String(id))
               .reduce((sum, l) => sum + Number(l.amount || 0), 0)
           : 0;
-        // Count only referral rewards for completed days, never the referred
-        // user's own earnings. This keeps the card total accurate:
-        // 1 completed day = daily reward + earned commission.
-        const savedDailyRewards = r.dailyRewards || {};
-        const referralRewardEarned = Object.keys(savedDailyRewards).length
-          ? Object.values(savedDailyRewards)
-              .filter((day) => day && day.claimed)
-              .reduce((sum, day) => sum + Number(day.reward || r.reward || 0), 0)
-          : (r.status === 'active' ? Number(r.reward || 0) : 0);
+        const status = (r.status === 'active' || r.status === 'completed') ? 'completed' : 'pending';
+        // مكافأة الإحالة تُصرف مرة واحدة فقط — إما اتصرفت بالكامل
+        // (completed) أو لسه (pending) وبالتالي = 0.
+        const referralRewardEarned = status === 'completed'
+          ? Number(r.rewardPaid ?? r.reward ?? 0)
+          : 0;
         const fraudMultipleAccounts = !!blocked;
-        const days = referralDays(r, referredUser, todayKeyCairo(), getReferralPayoutDays(config));
-        const completedDays = days.filter((d) => d.claimed).length;
         return {
           id,
           ...r,
@@ -1323,12 +1341,10 @@ async function handleGetState(env, ctx) {
           lastName: referredUser?.lastName || '',
           username: referredUser?.username || r.username || '',
           photoUrl: referredUser?.photoUrl || r.photoUrl || '',
-          status: completedDays >= 3 ? 'completed' : completedDays > 0 ? 'active' : 'pending',
+          status,
           adsWatched,
           adsRequired: 10,
           adsRemaining: Math.max(0, 10 - adsWatched),
-          days,
-          completedDays,
           totalEarned,
           referrerEarned,
           referralRewardEarned,
@@ -1417,7 +1433,7 @@ async function handleGetState(env, ctx) {
     referralStats: {
       total: referrals.length,
       active: activeReferralsCount,
-     inactive: referrals.filter((r) => r.status !== 'active' && r.status !== 'completed' && !r.fraudMultipleAccounts).length,
+     inactive: referrals.filter((r) => r.status !== 'completed' && !r.fraudMultipleAccounts).length,
       multipleAccounts: referrals.filter((r) => r.fraudMultipleAccounts).length,
       commissionEarned: referrals.reduce((sum, r) => sum + Number(r.referrerEarned || 0), 0),
     },
@@ -1645,8 +1661,8 @@ async function handleCheckForceSub(env, ctx) {
 // ───────────────────────── POST /startTask ─────────────────────────
 // يُستدعى من الواجهة لحظة ضغط المستخدم على "Join" وفتح رابط المهمة.
 // بيسجّل وقت البدء في السيرفر (وليس في المتصفح) عشان نقدر نفرض فترة
-// الانتظار الحقيقية (52 ثانية) على مهام "الانضمام لبوت" بدون إمكانية
-// التحايل عليها من الواجهة الأمامية ─────
+// الانتظار الحقيقية (15 ثانية - BOT_TASK_WAIT_SECONDS) على مهام "الانضمام
+// لبوت" بدون إمكانية التحايل عليها من الواجهة الأمامية ─────
 async function handleStartTask(env, ctx) {
   const { user, body } = ctx;
   const telegramId = user.telegramId;
@@ -1702,16 +1718,20 @@ async function handleVerifyTask(env, ctx) {
 
   if (task.category === 'bots') {
      // Bot tasks cannot be verified through Telegram Bot API. The server
-     // records the link-open time and enforces a three-second wait.
+     // records the link-open time and enforces a real BOT_TASK_WAIT_SECONDS
+     // (15s) wait that can't be bypassed from the frontend. The message
+     // shown to the user is simplified on purpose ("wait 5 seconds inside
+     // the bot") as part of the fake/simplified verification UX — the
+     // real enforced delay stays 15 seconds regardless of what the user
+     // is told.
     const startedAt = await dbGet(env, `taskStarts/${telegramId}/${taskId}`);
     if (!startedAt) {
-       return fail('Open the bot link first by pressing Join');
+       return fail('قم بفتح البوت وانتظر بداخله 5 ثوانٍ، ثم اضغط على تحقق');
     }
     const elapsedMs = Date.now() - startedAt;
     const requiredMs = BOT_TASK_WAIT_SECONDS * 1000;
     if (elapsedMs < requiredMs) {
-      const remaining = Math.ceil((requiredMs - elapsedMs) / 1000);
-       return fail(`Wait ${remaining} seconds after opening the bot, then press Verify`);
+       return fail('قم بفتح البوت وانتظر بداخله 5 ثوانٍ، ثم اضغط على تحقق');
     }
   } else {
      // Channel tasks use a real live membership check through Telegram Bot API.
@@ -1775,7 +1795,9 @@ async function handleClaimTask(env, ctx) {
 
   const referralsRaw = await dbGet(env, `referrals/${telegramId}`);
   const referralsList = referralsRaw ? Object.values(referralsRaw) : [];
-  const referralsCount = referralsList.filter((r) => (r.status || 'active') === 'active').length;
+  // إحالة "نشطة" = وصلت لحالة completed (صرفت مكافأتها) — أو active من
+  // نظام الأيام القديم (سجلات قديمة لم تُهاجَر بعد).
+  const referralsCount = referralsList.filter((r) => r.status === 'active' || r.status === 'completed').length;
   const required = task.requiredReferrals || task.requiredCount || 0;
 
   if (referralsCount < required) {
@@ -1874,7 +1896,7 @@ async function handleSpinWheel(env, ctx) {
 
   const referralsRaw = await dbGet(env, `referrals/${telegramId}`);
   const referralsList = referralsRaw ? Object.values(referralsRaw) : [];
-  const activeReferralsCount = referralsList.filter((r) => (r.status || 'active') === 'active').length;
+  const activeReferralsCount = referralsList.filter((r) => r.status === 'active' || r.status === 'completed').length;
 
   const freshUser = await dbGet(env, `users/${telegramId}`);
   const spinsUsed = freshUser?.wheelSpinsUsed || 0;
@@ -1952,18 +1974,241 @@ async function handleCheckCombo(env, ctx) {
   return ok({ correct: true, shibaBalance: newBalance, shibaAdded: reward });
 }
 
+// ════════════════════════════════════════════════════════════════════
+//  تصنيف الإحالات الأسبوعي (Weekly Referral Leaderboard/Contest)
+// ════════════════════════════════════════════════════════════════════
+//  البنية داخل Firebase:
+//   weeklyContest/state          -> { periodId, startTs, endTs }  (الأسبوع الحالي)
+//   weeklyContest/history/{id}   -> نتائج/جوائز أسبوع منتهى، وبتُستخدم
+//                                   كـ "قفل" لمنع صرف نفس الأسبوع مرتين.
+//
+//  فكرة الحساب: كل إحالة (دعوة) مسجّلة أصلًا تحت referrals/{referrerId}/
+//  {referredId} ومعاها joinedAt (وقت انضمام المدعو). عشان "الاحالات
+//  تتحسب من فترة بدء المسابقة فقط"، بنعدّ بس الإحالات اللي joinedAt
+//  بتاعها وقعت بعد startTs الحالي — أي إحالات قديمة قبل بداية الأسبوع
+//  الحالي (حتى لو نفس المستخدم) متتحسبش ضمن نقاط الأسبوع ده.
+// ════════════════════════════════════════════════════════════════════
+
+function weeklyContestPrizes(config) {
+  const arr = Array.isArray(config?.weeklyContestPrizesTon) && config.weeklyContestPrizesTon.length === 10
+    ? config.weeklyContestPrizesTon
+    : DEFAULT_CONFIG.weeklyContestPrizesTon;
+  return arr.map((n) => Number(n) || 0);
+}
+
+function weeklyContestDuration(config) {
+  const n = Number(config?.weeklyContestDurationMs);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_CONFIG.weeklyContestDurationMs;
+}
+
+function makeWeeklyPeriodId(startTs) {
+  return `wc_${startTs}`;
+}
+
+// يتأكد إن فيه فترة مسابقة حالية محفوظة في Firebase، ولو مفيش (أول
+// تشغيل للنظام) بينشئ فترة جديدة تبدأ فورًا. لا يتحقق من انتهاء الفترة
+// (ده مسؤولية ensureWeeklyContestUpToDate).
+async function getOrInitWeeklyContestState(env, config) {
+  let state = await dbGet(env, 'weeklyContest/state');
+  if (!state || !state.startTs || !state.endTs) {
+    const startTs = Date.now();
+    state = { periodId: makeWeeklyPeriodId(startTs), startTs, endTs: startTs + weeklyContestDuration(config) };
+    await dbSet(env, 'weeklyContest/state', state);
+  }
+  return state;
+}
+
+// يحسب تصنيف الإحالات لفترة [startTs, endTs) اعتمادًا على joinedAt
+// المخزّنة تحت referrals/{referrerId}/{referredId}. بيرجع كل المستخدمين
+// اللي دعوا مستخدم واحد على الأقل خلال الفترة، مرتبين تنازليًا حسب
+// العدد. عند تساوي العدد بين مستخدمين، يتم تفضيل من بدأ الدعوة أبكر
+// (أقدم إحالة له ضمن الفترة) كتقريب عملي لـ"مين وصل للرقم ده الأول".
+async function computeWeeklyReferralLeaderboard(env, startTs, endTs) {
+  const [allReferrals, allUsers] = await Promise.all([
+    dbGet(env, 'referrals'),
+    dbGet(env, 'users'),
+  ]);
+  const rows = [];
+  if (allReferrals) {
+    for (const [referrerId, refs] of Object.entries(allReferrals)) {
+      if (!refs || typeof refs !== 'object') continue;
+      let count = 0;
+      let earliestTs = Infinity;
+      for (const r of Object.values(refs)) {
+        const status = r?.status || 'active';
+        const isActive = status === 'active' || status === 'completed';
+        const joinedAt = Number(r?.joinedAt || 0);
+        // بنحسب فقط الإحالات "النشطة" (active/completed) اللي انضمت خلال
+        // الفترة الحالية — أي إحالة غير نشطة (لسه ما فعّلتش الاشتراك
+        // الإجباري أو محسوبة احتيال) لا تُحتسب في التصنيف إطلاقًا.
+        if (isActive && joinedAt >= startTs && joinedAt < endTs) {
+          count += 1;
+          if (joinedAt < earliestTs) earliestTs = joinedAt;
+        }
+      }
+      if (count > 0) {
+        const u = (allUsers && allUsers[referrerId]) || {};
+        rows.push({
+          telegramId: referrerId,
+          firstName: u.firstName || '',
+          username: u.username || '',
+          photoUrl: u.photoUrl || '',
+          count,
+          earliestTs,
+        });
+      }
+    }
+  }
+  rows.sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    if (a.earliestTs !== b.earliestTs) return a.earliestTs - b.earliestTs;
+    return String(a.telegramId).localeCompare(String(b.telegramId));
+  });
+  return rows;
+}
+
+// يوزّع جوائز أسبوع منتهى (لو مش اتوزعت قبل كده) ثم يبدأ فترة جديدة
+// فورًا بعده (استمرارية بدون فجوة زمنية بين الأسابيع). بيستخدم
+// weeklyContest/history/{periodId} كقفل: أول حاجة بتتعمل هي تسجيل
+// "distributing: true" قبل حساب/صرف أي جايزة، فلو النظام اتنادى تاني
+// لنفس الفترة (سواء من طلب مستخدم أو من الفحص الدوري) هيلاقي القفل
+// ويتجاهلها بدل ما يصرف الجايزة مرتين.
+async function finalizeAndAdvanceWeeklyPeriod(env, config, state) {
+  const periodId = state.periodId || makeWeeklyPeriodId(state.startTs);
+  const historyPath = `weeklyContest/history/${periodId}`;
+
+  const existingHistory = await dbGet(env, historyPath);
+  if (!existingHistory || (!existingHistory.distributed && !existingHistory.distributing)) {
+    // قفل مبدئي فورًا قبل أي حساب أو صرف — أهم سطر في منع الصرف المزدوج.
+    await dbSet(env, historyPath, {
+      startTs: state.startTs,
+      endTs: state.endTs,
+      distributed: false,
+      distributing: true,
+      lockedAt: Date.now(),
+    });
+
+    const leaderboard = await computeWeeklyReferralLeaderboard(env, state.startTs, state.endTs);
+    const prizes = weeklyContestPrizes(config);
+    const winners = [];
+
+    for (let i = 0; i < prizes.length; i++) {
+      const row = leaderboard[i];
+      const prizeTon = prizes[i];
+      if (!row || !(prizeTon > 0)) continue;
+      try {
+        const freshUser = await dbGet(env, `users/${row.telegramId}`);
+        const currentTonBalance = Number(freshUser?.tonBalance || 0);
+        const newTonBalance = Number((currentTonBalance + prizeTon).toFixed(6));
+        await dbUpdate(env, `users/${row.telegramId}`, { tonBalance: newTonBalance });
+        await addBalanceLog(env, row.telegramId, {
+          type: 'weekly_referral_contest_prize',
+          amount: prizeTon,
+          currency: 'TON',
+          rank: i + 1,
+          referralsCount: row.count,
+          periodId,
+          ts: Date.now(),
+        });
+        await sendTelegramMessage(env, config.botToken || '', row.telegramId,
+          `🏆 Weekly Referral Contest results!\n\nYou finished #${i + 1} this week with ${row.count} referral${row.count === 1 ? '' : 's'}.\n\n💎 +${prizeTon} TON has been credited to your balance automatically.\n\n🔄 A brand new weekly contest just started — invite friends to compete again!`);
+        winners.push({ rank: i + 1, telegramId: row.telegramId, firstName: row.firstName, username: row.username, photoUrl: row.photoUrl, count: row.count, prizeTon });
+      } catch (err) {
+        // فشل صرف جايزة مستخدم واحد ميوقفش صرف باقي المستخدمين — بنسجل
+        // الخطأ في السجل التاريخي عشان تقدر تراجعه يدويًا من Firebase.
+        winners.push({ rank: i + 1, telegramId: row.telegramId, count: row.count, prizeTon, error: String(err && err.message || err) });
+      }
+    }
+
+    await dbSet(env, historyPath, {
+      startTs: state.startTs,
+      endTs: state.endTs,
+      distributed: true,
+      distributing: false,
+      distributedAt: Date.now(),
+      totalPrizeTon: winners.reduce((s, w) => s + (w.error ? 0 : w.prizeTon), 0),
+      winners,
+    });
+  }
+  // لو كانت الفترة أصلًا "distributing: true" من محاولة سابقة اتقطعت
+  // فجأة (مثلاً السيرفر اتقفل أثناء الصرف)، بنسيبها كده من غير إعادة
+  // محاولة تلقائية — الأمان من صرف مزدوج أهم من استمرارية 100% تلقائية،
+  // وتقدر تراجعها يدويًا من Firebase تحت نفس المسار.
+
+  const nextStartTs = state.endTs;
+  const nextState = {
+    periodId: makeWeeklyPeriodId(nextStartTs),
+    startTs: nextStartTs,
+    endTs: nextStartTs + weeklyContestDuration(config),
+  };
+  await dbSet(env, 'weeklyContest/state', nextState);
+  return nextState;
+}
+
+// نقطة الدخول الرئيسية لتحديث حالة المسابقة: بترجع الفترة الحالية بعد
+// ما تتأكد إنها فعلاً "حالية" (لو خلصت فترة أو أكتر وإحنا مكناش عارفين،
+// زي لو السيرفر كان مقفول لفترة، بيلف على كل فترة خلصت ويوزع جوائزها
+// بالترتيب قبل ما يرجّع الفترة النشطة الحالية).
+async function ensureWeeklyContestUpToDate(env, config) {
+  let state = await getOrInitWeeklyContestState(env, config);
+  let guard = 0; // حماية بسيطة من أي حلقة لا نهائية غير متوقعة
+  while (Date.now() >= state.endTs && guard < 60) {
+    state = await finalizeAndAdvanceWeeklyPeriod(env, config, state);
+    guard++;
+  }
+  return state;
+}
+
+// ───────────────────────── POST /getWeeklyLeaderboard ─────────────────────────
+// تصنيف الإحالات الأسبوعي: أعلى 10 مستخدمين حسب عدد الإحالات المسجّلة
+// من "بداية الأسبوع الحالي" فقط (وليس إجمالي إحالاتهم من الأول)، + وقت
+// انتهاء الأسبوع الحالي (للتايمر في الواجهة) + ترتيب المستخدم الحالي.
+async function handleGetWeeklyLeaderboard(env, ctx) {
+  const { user, config } = ctx;
+  const state = await ensureWeeklyContestUpToDate(env, config);
+  const leaderboard = await computeWeeklyReferralLeaderboard(env, state.startTs, state.endTs);
+  const prizes = weeklyContestPrizes(config);
+
+  const TOP_LIMIT = 25;
+  const top = leaderboard.slice(0, TOP_LIMIT).map((row, i) => ({
+    rank: i + 1,
+    telegramId: row.telegramId,
+    firstName: row.firstName,
+    username: row.username,
+    photoUrl: row.photoUrl,
+    referralsThisWeek: row.count,
+    activeReferrals: row.count,
+    prizeTon: prizes[i] || 0,
+  }));
+
+  const myIndex = leaderboard.findIndex((r) => String(r.telegramId) === String(user.telegramId));
+
+  return ok({
+    weekStartTs: state.startTs,
+    weekEndTs: state.endTs,
+    prizesTon: prizes,
+    totalPrizePoolTon: Number(prizes.reduce((s, n) => s + n, 0).toFixed(4)),
+    leaderboard: top,
+    topLimit: TOP_LIMIT,
+    myRank: myIndex >= 0 ? myIndex + 1 : null,
+    myReferralsThisWeek: myIndex >= 0 ? leaderboard[myIndex].count : 0,
+    myActiveReferrals: myIndex >= 0 ? leaderboard[myIndex].count : 0,
+    note: 'Ranking is based only on ACTIVE referrals joined since the start of this round — inactive/unverified invites are never counted.',
+  });
+}
+
 // ───────────────────────── POST /getReferrals ─────────────────────────
 async function handleGetReferrals(env, ctx) {
   const { user } = ctx;
   const referralsRaw = await dbGet(env, `referrals/${user.telegramId}`);
   const referrals = referralsRaw
-    ? Object.entries(referralsRaw).map(([id, r]) => ({ id, ...r, status: r.status || 'active' }))
+    ? Object.entries(referralsRaw).map(([id, r]) => ({ id, ...r, status: r.status || 'pending' }))
     : [];
 
   return ok({
     referrals,
     total: referrals.length,
-    active: referrals.filter((r) => r.status === 'active').length,
+    active: referrals.filter((r) => r.status === 'active' || r.status === 'completed').length,
     referralCode: user.referralCode,
   });
 }
@@ -2173,54 +2418,6 @@ async function handleConvertPmtToTon(env, ctx) {
   return ok({ shibaBalance: pmtBalance - pmtAmount, tonBalance, pmtAmount, tonAdded });
 }
 
-// ───────────────────────── POST /getWithdrawalsRecord ─────────────────────────
-// يعرض قائمة عامة (لكل المستخدمين) بآخر عمليات السحب المكتملة فقط،
-// لصفحة "Record" في الواجهة: صورة + اسم المستخدم + المبلغ + زر لعرض
-// تفاصيل المعاملة. يعتمد على اللقطة (firstName/username/photoUrl)
-// المخزّنة داخل withdrawals/{telegramId}/{id} وقت إنشاء الطلب، فمفيش
-// حاجة إننا نقرأ users/ لكل مستخدم على حدة.
-async function handleGetWithdrawalsRecord(env, ctx) {
-  // بنجيب users/ كمان عشان لو أي بوت/سكريبت خارجي مسؤول عن الدفع الفعلي
-  // عمل overwrite (PUT) على withdrawals/{telegramId}/{id} ومسح اللقطة
-  // الأصلية (firstName/username/photoUrl)، نقدر نرجّع الاسم والصورة من
-  // بيانات المستخدم الحالية بدل ما نعرض "User" وأفاتار فاضي.
-  const [allWithdrawals, allUsers] = await Promise.all([
-    dbGet(env, 'withdrawals'),
-    dbGet(env, 'users'),
-  ]);
-  const list = [];
-  if (allWithdrawals) {
-    for (const [telegramId, userWithdrawals] of Object.entries(allWithdrawals)) {
-      if (!userWithdrawals || typeof userWithdrawals !== 'object') continue;
-      const u = (allUsers && allUsers[telegramId]) || {};
-      for (const [id, w] of Object.entries(userWithdrawals)) {
-        if (!w || (w.status !== 'completed' && w.status !== 'paid')) continue;
-        list.push({
-          id,
-          telegramId,
-          firstName: w.firstName || u.firstName || '',
-          username: w.username || u.username || '',
-          photoUrl: w.photoUrl || u.photoUrl || '',
-          // بعض السجلات (اللي بيكتبها البوت الخارجي المسؤول عن الدفع)
-          // بتستخدم أسماء حقول مختلفة (ton / sentAmount / address) بدل
-          // (amount / netAmount / walletAddress)، فبنغطي الحالتين.
-          amount: w.netAmount != null ? w.netAmount : (w.amount != null ? w.amount : (w.sentAmount != null ? w.sentAmount : (w.ton != null ? w.ton : 0))),
-          requestedAmount: w.requestedAmount != null ? w.requestedAmount : w.amount,
-          fee: w.fee || 0,
-          currency: w.currency || 'TON',
-          walletAddress: w.walletAddress || w.address || '',
-          txHash: w.txHash || '',
-          ts: w.ts || 0,
-          completedAt: w.completedAt || w.ts || 0,
-        });
-      }
-    }
-  }
-  list.sort((a, b) => (b.completedAt || b.ts || 0) - (a.completedAt || a.ts || 0));
-  const limit = Math.min(Math.max(Number(ctx.body.limit) || 50, 1), 100);
-  return ok({ withdrawals: list.slice(0, limit) });
-}
-
 // ════════════════════════════════════════════════════════════════════
 //  جدول التوجيه (Routing Table)
 // ════════════════════════════════════════════════════════════════════
@@ -2239,9 +2436,9 @@ const ROUTES = {
   '/checkCombo': handleCheckCombo,
   '/spinWheel': handleSpinWheel,
   '/getReferrals': handleGetReferrals,
+  '/getWeeklyLeaderboard': handleGetWeeklyLeaderboard,
   '/checkForceSub': handleCheckForceSub,
   '/requestWithdrawal': handleRequestWithdrawal,
-  '/getWithdrawalsRecord': handleGetWithdrawalsRecord,
   '/createDeposit': handleCreateDeposit,
   '/verifyDeposit': handleVerifyDeposit,
   '/convertPmtToTon': handleConvertPmtToTon,
@@ -2349,13 +2546,16 @@ async function handleFetch(request, env) {
       try {
         const accountBlocked = await dbGet(env, `blocked_accounts/${user.telegramId}`);
         if (accountBlocked) {
-          return fail(accountBlocked.reason || 'هذا الحساب محظور من استخدام البوت', 403);
+          return failBlocked(accountBlocked.reason, accountBlocked.reasonCode);
         }
       } catch (_) {}
       // ─────────────────────────────────────────────────────────────
 
-      // ── طبقة الحماية ضد الاحتيال ─────────────────────────────────
+      // ── طبقة الحماية ضد الاحتيال (تعدد الحسابات عبر بصمة الجهاز) ──
       const fraudResult = await checkAntiFraud(env, request, user.telegramId, body);
+      if (fraudResult.blocked) {
+        return failBlocked(fraudResult.reason, fraudResult.reasonCode);
+      }
       // ─────────────────────────────────────────────────────────────
 
       const ctx = { user, body, tgUser: verification.user, config, botToken, botUsername, fraudResult, ip };
@@ -2424,3 +2624,29 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server is running on port ${PORT}`);
 });
+
+// ════════════════════════════════════════════════════════════════════
+//  المسابقة الأسبوعية للإحالات — فحص دوري تلقائي (بديل Cron Job)
+//  بما إن السيرفر ده Node.js عادي شغال باستمرار على Railway (مش
+//  Serverless زي Cloudflare Workers)، نقدر نستخدم setInterval عادي
+//  يتأكد كل دقيقة هل الأسبوع الحالي خلص ولا لأ. لو خلص: يوزع الجوائز
+//  تلقائيًا على أول 10 في التصنيف ويبدأ أسبوع جديد فورًا — من غير ما
+//  يحتاج أي مستخدم يفتح البوت في اللحظة اللي بيخلص فيها الأسبوع.
+//  (نفس الحماية من الصرف المزدوج بتاعة weeklyContest/history/{id}
+//  موجودة برضه هنا، فحتى لو الفحص الدوري ده اتنادى في نفس اللحظة اللي
+//  حد بيفتح فيها البوت، مش هيحصل صرف مرتين لنفس الأسبوع).
+// ════════════════════════════════════════════════════════════════════
+const WEEKLY_CONTEST_CHECK_INTERVAL_MS = 60 * 1000; // كل دقيقة
+let weeklyContestTickRunning = false;
+setInterval(async () => {
+  if (weeklyContestTickRunning) return;
+  weeklyContestTickRunning = true;
+  try {
+    const config = await getConfig(process.env);
+    await ensureWeeklyContestUpToDate(process.env, config);
+  } catch (err) {
+    console.error('⚠️ Weekly contest check failed:', err.message);
+  } finally {
+    weeklyContestTickRunning = false;
+  }
+}, WEEKLY_CONTEST_CHECK_INTERVAL_MS);
