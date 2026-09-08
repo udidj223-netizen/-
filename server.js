@@ -107,11 +107,11 @@ const DEPOSIT_RECEIVER_WALLET = 'UQAACNWWtTtN7ILkhRERwYUTzo06Bd1Tv_8Yk5gPioIMFoU
 // موجودة، وبعد ذلك تصبح قابلة للتعديل بالكامل من Firebase (لا يتم
 // التعديل عليها تلقائيًا مرة أخرى حتى لو الكود تغيّر) ─────
 const FIXED_INVITE_TASKS = [
-  { id: 'invite_1',   title: 'دعوة 1 مستخدم',    requiredReferrals: 1,   reward: 1000 },
-  { id: 'invite_10',  title: 'دعوة 10 مستخدمين', requiredReferrals: 10,  reward: 10000 },
-  { id: 'invite_25',  title: 'دعوة 25 مستخدم',   requiredReferrals: 25,  reward: 25000 },
-  { id: 'invite_50',  title: 'دعوة 50 مستخدم',   requiredReferrals: 50,  reward: 50000 },
-  { id: 'invite_100', title: 'دعوة 100 مستخدم',  requiredReferrals: 100, reward: 100000 },
+  { id: 'invite_1',   title: 'Invite 1 user',    requiredReferrals: 1,   reward: 1000 },
+  { id: 'invite_10',  title: 'Invite 10 users', requiredReferrals: 10,  reward: 10000 },
+  { id: 'invite_25',  title: 'Invite 25 users',   requiredReferrals: 25,  reward: 25000 },
+  { id: 'invite_50',  title: 'Invite 50 users',   requiredReferrals: 50,  reward: 50000 },
+  { id: 'invite_100', title: 'Invite 100 users',  requiredReferrals: 100, reward: 100000 },
 ];
 
 // ───────── قنوات الاشتراك الإجباري الافتراضية — تُنشأ مرة واحدة فقط لو
@@ -217,13 +217,13 @@ function afCalcScore(flags) {
 
 function afBuildReason(flags) {
   const parts = [];
-  if (flags.deviceIdReused)     parts.push('نفس معرف الجهاز');
-  if (flags.fingerprintReused)  parts.push('نفس بصمة الجهاز');
-  if (flags.rapidAccountCreate) parts.push('إنشاء حسابات متعددة بسرعة');
-  if (flags.headlessBrowser)    parts.push('متصفح headless');
-  if (flags.emulatorDetected)   parts.push('emulator مشتبه');
-  if (flags.sameIpManyAccounts) parts.push('عدة حسابات من نفس الشبكة');
-  return parts.length ? parts.join(' | ') : 'نشاط مشبوه';
+  if (flags.deviceIdReused)     parts.push('Same device ID');
+  if (flags.fingerprintReused)  parts.push('Same device fingerprint');
+  if (flags.rapidAccountCreate) parts.push('Multiple accounts created quickly');
+  if (flags.headlessBrowser)    parts.push('Headless browser');
+  if (flags.emulatorDetected)   parts.push('Suspected emulator');
+  if (flags.sameIpManyAccounts) parts.push('Multiple accounts from the same network');
+  return parts.length ? parts.join(' | ') : 'Suspicious activity';
 }
 
 // جامع الحسابات المرتبطة بنفس الجهاز (لعرضها في صفحة الحظر بالواجهة).
@@ -271,7 +271,7 @@ async function checkAntiFraud(env, request, telegramId, body) {
   try {
     const accountBlocked = await dbGet(env, `blocked_accounts/${tid}`);
     if (accountBlocked) {
-      return { blocked: false, referralBlocked: true, reason: 'الحساب ممنوع من مكافآت الإحالة' };
+      return { blocked: false, referralBlocked: true, reason: 'This account is banned from referral rewards' };
     }
   } catch (_) {}
 
@@ -420,7 +420,7 @@ async function checkAntiFraud(env, request, telegramId, body) {
   const corroboratedFpBlock = flags.fingerprintReused && score >= AF_FRAUD_SCORE_BLOCK;
 
   if (hardBlock || corroboratedFpBlock) {
-    const reason = 'تم اكتشاف استخدام أكثر من حساب على نفس الجهاز. الحساب الأول المُنشأ على هذا الجهاز فقط هو المسموح باستخدام البوت.';
+    const reason = 'Multiple accounts detected on the same device. Only the first account created on this device is allowed to use the bot.';
     try {
       await dbUpdate(env, `blocked_accounts/${tid}`, {
         reason, reasonCode: 'multi_account', score, ts: nowMs,
@@ -438,7 +438,7 @@ async function checkAntiFraud(env, request, telegramId, body) {
   // الإحالة بس كإجراء احترازي، من غير ما نمنع الحساب نفسه من استخدام
   // البوت — لحد ما يتأكد بدليل إضافي أو يراجعها الأدمن يدويًا.
   if (flags.fingerprintReused) {
-    return { blocked: false, referralBlocked: true, reason: 'تم رصد نشاط مشتبه، مكافآت الإحالة موقوفة مؤقتًا لحين المراجعة', reasonCode: 'fingerprint_review', score };
+    return { blocked: false, referralBlocked: true, reason: 'Suspicious activity detected — referral rewards are temporarily paused pending review', reasonCode: 'fingerprint_review', score };
   }
 
   return { blocked: false, referralBlocked: false, score };
@@ -448,7 +448,7 @@ async function isReferralEligible(env, newUserTelegramId) {
   try {
     const tid = String(newUserTelegramId);
     const blocked = await dbGet(env, `blocked_accounts/${tid}`);
-    if (blocked) return { eligible: false, reason: blocked.reason || 'جهاز محظور', reasonCode: blocked.reasonCode };
+    if (blocked) return { eligible: false, reason: blocked.reason || 'Device banned', reasonCode: blocked.reasonCode };
   } catch (_) {}
   return { eligible: true };
 }
@@ -494,7 +494,7 @@ function failCaptcha(error) {
 function failBlocked(reason, reasonCode, linkedAccounts) {
   return json({
     success: false,
-    error: reason || 'هذا الحساب محظور من استخدام البوت',
+    error: reason || 'This account is banned from using the bot',
     blocked: true,
     reasonCode: reasonCode || 'blocked',
     linkedAccounts: Array.isArray(linkedAccounts) ? linkedAccounts : [],
@@ -538,6 +538,23 @@ function generateReferralCode(telegramId) {
   return `${String(telegramId).slice(-4)}${rand}`.slice(0, 10);
 }
 
+// Generates a referral code and verifies it isn't already taken before
+// handing it back. The old version never checked for collisions, so two
+// users could in rare cases end up sharing the same code, which would make
+// referral links silently stop working for one of them (lookups only ever
+// return a single match). This retries a few times with a fresh random
+// suffix, and falls back to a timestamp-based suffix that's guaranteed
+// unique if it somehow still collides after 5 tries.
+async function generateUniqueReferralCode(env, telegramId) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generateReferralCode(telegramId);
+    const lookup = await findUserByReferralCode(env, code);
+    if (!lookup.user) return code;
+  }
+  const uniqueSuffix = Date.now().toString(36).toUpperCase().slice(-6);
+  return `${String(telegramId).slice(-4)}${uniqueSuffix}`.slice(0, 10);
+}
+
 function todayKeyUTC() {
   const d = new Date();
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
@@ -570,12 +587,12 @@ function cleanupExpiredHashes() {
 // ──────────────────────────────────────────────────────────────────────
 async function verifyTelegramInitData(initData, botToken) {
   if (!initData || typeof initData !== 'string' || initData.length < 10) {
-    return { valid: false, error: 'initData مفقود أو غير صالح' };
+    return { valid: false, error: 'initData is missing or invalid' };
   }
 
   const params = new URLSearchParams(initData);
   const hash = params.get('hash');
-  if (!hash) return { valid: false, error: 'لا يوجد hash في initData' };
+  if (!hash) return { valid: false, error: 'No hash found in initData' };
 
   const pairs = [];
   for (const [key, value] of params.entries()) {
@@ -588,7 +605,7 @@ async function verifyTelegramInitData(initData, botToken) {
   const authDate = parseInt(params.get('auth_date') || '0', 10);
   const nowSec = Math.floor(Date.now() / 1000);
   if (!authDate || nowSec - authDate > INIT_DATA_MAX_AGE) {
-    return { valid: false, error: 'initData منتهي الصلاحية (Replay Protection)' };
+    return { valid: false, error: 'initData has expired (Replay Protection)' };
   }
 
   try {
@@ -614,7 +631,7 @@ async function verifyTelegramInitData(initData, botToken) {
     const computedHash = bufferToHex(computedHashBuffer);
 
     if (computedHash !== hash) {
-      return { valid: false, error: 'توقيع initData غير صحيح (تأكد من أن BOT_TOKEN صحيح)' };
+      return { valid: false, error: 'Invalid initData signature (check that BOT_TOKEN is correct)' };
     }
 
     cleanupExpiredHashes();
@@ -623,7 +640,7 @@ async function verifyTelegramInitData(initData, botToken) {
     const userJson = params.get('user');
     const user = userJson ? JSON.parse(userJson) : null;
     if (!user || !user.id) {
-      return { valid: false, error: 'لا يوجد بيانات مستخدم في initData' };
+      return { valid: false, error: 'No user data found in initData' };
     }
 
     // ───── start_param: القيمة دي بتتولّد فقط لو رابط الدعوة كان بصيغة
@@ -636,7 +653,7 @@ async function verifyTelegramInitData(initData, botToken) {
       authDate,
     };
   } catch (err) {
-    return { valid: false, error: 'فشل التحقق من initData: ' + err.message };
+    return { valid: false, error: 'Failed to verify initData: ' + err.message };
   }
 }
 
@@ -650,7 +667,7 @@ function dbUrl(env, path) {
 
 async function dbGet(env, path) {
   const res = await fetch(dbUrl(env, path));
-  if (!res.ok) throw new Error(`Firebase GET فشل (${res.status}) على ${path}`);
+  if (!res.ok) throw new Error(`Firebase GET failed (${res.status}) on ${path}`);
   return await res.json();
 }
 
@@ -660,7 +677,7 @@ async function dbSet(env, path, value) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
   });
-  if (!res.ok) throw new Error(`Firebase PUT فشل (${res.status}) على ${path}`);
+  if (!res.ok) throw new Error(`Firebase PUT failed (${res.status}) on ${path}`);
   return await res.json();
 }
 
@@ -670,7 +687,7 @@ async function dbUpdate(env, path, value) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
   });
-  if (!res.ok) throw new Error(`Firebase PATCH فشل (${res.status}) على ${path}`);
+  if (!res.ok) throw new Error(`Firebase PATCH failed (${res.status}) on ${path}`);
   return await res.json();
 }
 
@@ -680,14 +697,14 @@ async function dbPush(env, path, value) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(value),
   });
-  if (!res.ok) throw new Error(`Firebase POST فشل (${res.status}) على ${path}`);
+  if (!res.ok) throw new Error(`Firebase POST failed (${res.status}) on ${path}`);
   const j = await res.json();
   return j.name;
 }
 
 async function dbDelete(env, path) {
   const res = await fetch(dbUrl(env, path), { method: 'DELETE' });
-  if (!res.ok) throw new Error(`Firebase DELETE فشل (${res.status}) على ${path}`);
+  if (!res.ok) throw new Error(`Firebase DELETE failed (${res.status}) on ${path}`);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -781,7 +798,7 @@ async function getOrCreateUser(env, tgUser, startParam, config, botToken) {
   let user = await dbGet(env, `users/${telegramId}`);
 
   if (!user) {
-    const referralCode = generateReferralCode(telegramId);
+    const referralCode = await generateUniqueReferralCode(env, telegramId);
     user = {
       telegramId,
       firstName: tgUser.first_name || '',
@@ -878,9 +895,23 @@ async function registerReferralIfNeeded(env, user, startParam, config) {
       return;
     }
 
-    const referrer = await findUserByReferralCode(env, referralCode);
+    const lookup = await findUserByReferralCode(env, referralCode);
+    const referrer = lookup.user;
     if (!referrer) {
-      await logAttempt({ result: 'referrer_not_found', codeSearched: referralCode });
+      // lookupSource/indexedQueryFailed/fallbackError tell us whether this
+      // was a genuine "no such code exists" (source: fallback, having
+      // scanned every user) or the lookup itself broke somewhere along the
+      // way (indexedQueryFailed / fallback_error) — previously both looked
+      // identical in the logs, making real failures indistinguishable from
+      // a mistyped or bogus code.
+      await logAttempt({
+        result: 'referrer_not_found',
+        codeSearched: referralCode,
+        lookupSource: lookup.source,
+        indexedQueryFailed: lookup.indexedQueryFailed,
+        indexedQueryError: lookup.indexedQueryError || null,
+        fallbackError: lookup.fallbackError || null,
+      });
       return;
     }
     if (String(referrer.telegramId) === telegramId) {
@@ -917,30 +948,54 @@ async function registerReferralIfNeeded(env, user, startParam, config) {
   }
 }
 
+// Returns { user, source, indexedQueryFailed, fallbackError }. The "source"
+// field tells the caller exactly how the answer was reached, so a
+// "not found" result can be told apart from a lookup that actually failed
+// (which used to be silently swallowed and looked identical to a genuine
+// miss in the debug logs — making real outages impossible to diagnose).
 async function findUserByReferralCode(env, code) {
   const base = env.FIREBASE_DATABASE_URL.replace(/\/$/, '');
   const url = `${base}/users.json?orderBy=${encodeURIComponent('"referralCode"')}&equalTo=${encodeURIComponent('"' + code + '"')}`;
-  const res = await fetch(url);
-  if (res.ok) {
-    const result = await res.json();
-    if (result) {
-      const key = Object.keys(result)[0];
-      if (key) return result[key];
+  let indexedQueryFailed = false;
+  let indexedQueryError = null;
+
+  try {
+    const res = await fetch(url);
+    if (res.ok) {
+      const result = await res.json();
+      if (result) {
+        const key = Object.keys(result)[0];
+        if (key) return { user: result[key], source: 'indexed' };
+      }
+    } else {
+      indexedQueryFailed = true;
+      indexedQueryError = `HTTP ${res.status}`;
     }
+  } catch (err) {
+    indexedQueryFailed = true;
+    indexedQueryError = String(err && err.message || err);
   }
 
-  // Fallback لو Firebase Rules أو الفهرس منعوا الاستعلام المفلتر.
-  // عدد المستخدمين عادة محدود، والبحث هنا يتم من السيرفر فقط.
+  // Fallback in case Firebase rules or a missing index blocked the filtered
+  // query above. The user count is normally small enough that scanning the
+  // whole table server-side is fine, and this comparison is case-insensitive
+  // so a code copied in a different case still matches.
   try {
     const allUsers = await dbGet(env, 'users');
-    if (!allUsers) return null;
+    if (!allUsers) return { user: null, source: 'fallback_no_users', indexedQueryFailed, indexedQueryError };
     const wanted = String(code).trim().toUpperCase();
     const match = Object.values(allUsers).find((u) =>
       String(u?.referralCode || '').trim().toUpperCase() === wanted
     );
-    return match || null;
-  } catch (_) {
-    return null;
+    return { user: match || null, source: 'fallback', indexedQueryFailed, indexedQueryError };
+  } catch (err) {
+    return {
+      user: null,
+      source: 'fallback_error',
+      indexedQueryFailed,
+      indexedQueryError,
+      fallbackError: String(err && err.message || err),
+    };
   }
 }
 
@@ -1570,7 +1625,7 @@ async function handleClaimDailyBonus(env, ctx) {
   const dateKey = todayKeyCairo();
   const freshUser = await dbGet(env, `users/${telegramId}`);
   if (freshUser?.dailyBonusDate === dateKey) {
-    return fail('لقد استلمت المكافأة اليومية بالفعل');
+    return fail("You've already claimed today's daily bonus");
   }
   const reward = Number(config.dailyBonusReward ?? DEFAULT_CONFIG.dailyBonusReward);
   const newBalance = await incrementBalance(env, telegramId, reward);
@@ -1584,17 +1639,17 @@ async function handleClaimDailyBonus(env, ctx) {
 async function handleRedeemCode(env, ctx) {
   const { user, body } = ctx;
   const code = String(body.code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 64);
-  if (!code) return fail('أدخل كود صحيح');
+  if (!code) return fail('Enter a valid code');
   const codePath = `redeemCodes/${code}`;
   const record = await dbGet(env, codePath);
-  if (!record || record.active === false) return fail('الكود غير موجود أو غير متاح');
-  if (record.expiresAt && Date.now() > Number(record.expiresAt)) return fail('انتهت صلاحية هذا الكود');
+  if (!record || record.active === false) return fail('Code not found or unavailable');
+  if (record.expiresAt && Date.now() > Number(record.expiresAt)) return fail('This code has expired');
   const maxUses = Number(record.maxUses || 0);
-  if (maxUses > 0 && Number(record.usedCount || 0) >= maxUses) return fail('تم استخدام الكود بالكامل');
+  if (maxUses > 0 && Number(record.usedCount || 0) >= maxUses) return fail('This code has been fully redeemed');
   const userUsePath = `redeemCodeUses/${user.telegramId}/${code}`;
-  if (await dbGet(env, userUsePath)) return fail('لقد استخدمت هذا الكود من قبل');
+  if (await dbGet(env, userUsePath)) return fail("You've already used this code");
   const reward = Math.floor(Number(record.reward));
-  if (!Number.isFinite(reward) || reward <= 0) return fail('قيمة الكود غير صالحة');
+  if (!Number.isFinite(reward) || reward <= 0) return fail('Invalid code value');
   const newBalance = await incrementBalance(env, user.telegramId, reward);
   await dbSet(env, userUsePath, { reward, redeemedAt: Date.now() });
   await dbUpdate(env, codePath, { usedCount: Number(record.usedCount || 0) + 1 });
@@ -1633,7 +1688,7 @@ async function handleClaimAdReward(env, ctx) {
     const secretKey = config.turnstileSecretKey || env.TURNSTILE_SECRET_KEY || DEFAULT_CONFIG.turnstileSecretKey;
     const verify = await verifyTurnstile(body.turnstileToken, ctx.ip, secretKey);
     if (!verify.success) {
-      return failCaptcha('يجب اجتياز التحقق الأمني (Captcha) للمتابعة والحصول على مكافأة الإعلان');
+      return failCaptcha('You must pass the security check (Captcha) to continue and receive the ad reward');
     }
   }
 
@@ -1705,13 +1760,13 @@ async function handlePlayGame(env, ctx) {
   const game = String(body.game || '');
   const maxRewards = { gem: 100, wheel: 81, xo: 20, fruit: 100 };
   const allowed = Object.keys(maxRewards);
-  if (!allowed.includes(game)) return fail('اللعبة غير صالحة');
+  if (!allowed.includes(game)) return fail('Invalid game');
 
   const dailyLimit = Number(config.gameDailyLimit ?? DEFAULT_CONFIG.gameDailyLimit);
   const dateKey = todayKeyCairo();
   const path = `gamePlays/${telegramId}/${dateKey}/${game}`;
   const used = Number(await dbGet(env, path) || 0);
-  if (used >= dailyLimit) return fail(`لقد استخدمت المحاولات المتاحة (${dailyLimit}) لهذه اللعبة اليوم`);
+  if (used >= dailyLimit) return fail(`You've used all your available attempts (${dailyLimit}) for this game today`);
 
   // ── كابتشا Cloudflare Turnstile قبل صرف مكافأة أي لعبة (كل مرة) ─────
   // نتحقق قبل استهلاك محاولة اللعب حتى لا يخسر المستخدم محاولته لو فشل
@@ -1719,7 +1774,7 @@ async function handlePlayGame(env, ctx) {
   const secretKey = config.turnstileSecretKey || env.TURNSTILE_SECRET_KEY || DEFAULT_CONFIG.turnstileSecretKey;
   const verify = await verifyTurnstile(body.turnstileToken, ctx.ip, secretKey);
   if (!verify.success) {
-    return failCaptcha('يجب اجتياز التحقق الأمني (Captcha) للمتابعة والحصول على مكافأة اللعبة');
+    return failCaptcha('You must pass the security check (Captcha) to continue and receive the game reward');
   }
 
   const submittedScore = Math.floor(Number(body.score || 0));
@@ -1760,17 +1815,17 @@ async function handleStartTask(env, ctx) {
   const taskId = body.taskId;
 
   if (!isNonEmptyString(taskId, 100)) {
-    return fail('taskId غير صالح');
+    return fail('Invalid taskId');
   }
 
   const task = await dbGet(env, `tasks/${taskId}`);
   if (!task || task.status !== 'active' || task.category === 'invite') {
-    return fail('المهمة غير موجودة أو غير مفعّلة');
+    return fail('Task not found or inactive');
   }
 
   const alreadyDone = await dbGet(env, `completedTasks/${telegramId}/${taskId}`);
   if (alreadyDone) {
-    return fail('تم استلام مكافأة هذه المهمة من قبل');
+    return fail("This task's reward has already been claimed");
   }
 
   // لا نستبدل وقت بدء سابق لو موجود (عشان حد ما يقدر يعيد تعيين العداد
@@ -1790,21 +1845,21 @@ async function handleVerifyTask(env, ctx) {
   const taskId = body.taskId;
 
   if (!isNonEmptyString(taskId, 100)) {
-    return fail('taskId غير صالح');
+    return fail('Invalid taskId');
   }
 
   const task = await dbGet(env, `tasks/${taskId}`);
   if (!task || task.status !== 'active') {
-    return fail('المهمة غير موجودة أو غير مفعّلة');
+    return fail('Task not found or inactive');
   }
 
   if (task.category === 'invite') {
-    return fail('هذا النوع من المهام يتم استلامه عبر /claimTask');
+    return fail('This task type is claimed via /claimTask');
   }
 
   const alreadyDone = await dbGet(env, `completedTasks/${telegramId}/${taskId}`);
   if (alreadyDone) {
-    return fail('تم استلام مكافأة هذه المهمة من قبل');
+    return fail("This task's reward has already been claimed");
   }
 
   if (task.category === 'bots') {
@@ -1817,12 +1872,12 @@ async function handleVerifyTask(env, ctx) {
      // is told.
     const startedAt = await dbGet(env, `taskStarts/${telegramId}/${taskId}`);
     if (!startedAt) {
-       return fail('قم بفتح البوت وانتظر بداخله 5 ثوانٍ، ثم اضغط على تحقق');
+       return fail('Open the bot, wait 5 seconds inside it, then tap Verify');
     }
     const elapsedMs = Date.now() - startedAt;
     const requiredMs = BOT_TASK_WAIT_SECONDS * 1000;
     if (elapsedMs < requiredMs) {
-       return fail('قم بفتح البوت وانتظر بداخله 5 ثوانٍ، ثم اضغط على تحقق');
+       return fail('Open the bot, wait 5 seconds inside it, then tap Verify');
     }
   } else {
      // Channel tasks use a real live membership check through Telegram Bot API.
@@ -1871,17 +1926,17 @@ async function handleClaimTask(env, ctx) {
   const taskId = body.taskId;
 
   if (!isNonEmptyString(taskId, 100)) {
-    return fail('taskId غير صالح');
+    return fail('Invalid taskId');
   }
 
   const task = await dbGet(env, `tasks/${taskId}`);
   if (!task || task.status !== 'active' || task.category !== 'invite') {
-    return fail('مهمة الدعوة غير موجودة أو غير صالحة');
+    return fail('Invite task not found or invalid');
   }
 
   const alreadyDone = await dbGet(env, `completedTasks/${telegramId}/${taskId}`);
   if (alreadyDone) {
-    return fail('تم استلام مكافأة هذه المهمة من قبل');
+    return fail("This task's reward has already been claimed");
   }
 
   const referralsRaw = await dbGet(env, `referrals/${telegramId}`);
@@ -1892,7 +1947,7 @@ async function handleClaimTask(env, ctx) {
   const required = task.requiredReferrals || task.requiredCount || 0;
 
   if (referralsCount < required) {
-    return fail(`تحتاج إلى ${required} إحالات نشطة على الأقل (لديك ${referralsCount})`);
+    return fail(`You need at least ${required} active referrals (you have ${referralsCount})`);
   }
 
   const reward = task.reward ?? config.taskDefaultReward ?? DEFAULT_CONFIG.taskDefaultReward;
@@ -1924,16 +1979,16 @@ async function handleSubmitTaskSuggestion(env, ctx) {
   const desc = body.desc || '';
 
   if (!isNonEmptyString(name, 120)) {
-    return fail('اسم المهمة غير صالح');
+    return fail('Invalid task name');
   }
   if (!isNonEmptyString(link, 300) || !isValidUrl(link)) {
-    return fail('رابط القناة غير صالح');
+    return fail('Invalid channel link');
   }
   if (!Number.isFinite(membersNeeded) || membersNeeded < 100) {
-    return fail('عدد الأعضاء المطلوب غير صالح (الحد الأدنى 100 عضو)');
+    return fail('Invalid required member count (minimum 100 members)');
   }
   if (typeof desc !== 'string' || desc.length > 1000) {
-    return fail('الملاحظات الإضافية طويلة جدًا');
+    return fail('Additional notes are too long');
   }
 
   const units = Math.ceil(membersNeeded / 100);
@@ -1994,7 +2049,7 @@ async function handleSpinWheel(env, ctx) {
   const spinsAvailable = computeSpinsAvailable(activeReferralsCount, spinsUsed);
 
   if (spinsAvailable <= 0) {
-    return fail(`لا توجد لفات متاحة. تحتاج إلى دعوة ${WHEEL_REFERRALS_PER_SPIN} أصدقاء نشطين لكل لفة جديدة`);
+    return fail(`No spins available. You need to invite ${WHEEL_REFERRALS_PER_SPIN} active friends for each new spin`);
   }
 
   const segmentIndex = pickWheelSegmentIndex();
@@ -2031,16 +2086,16 @@ async function handleCheckCombo(env, ctx) {
   const selection = body.selection;
 
   if (!Array.isArray(selection) || selection.length !== 4) {
-    return fail('يجب اختيار 4 عناصر بالضبط');
+    return fail('You must select exactly 4 items');
   }
   if (!selection.every((s) => typeof s === 'string' && s.length <= 8)) {
-    return fail('عناصر الاختيار غير صالحة');
+    return fail('Invalid selection items');
   }
 
   const dateKey = todayKeyUTC();
 
   if (user.comboClaimDate === dateKey) {
-    return fail('لقد استلمت مكافأة الكومبو اليوم بالفعل');
+    return fail("You've already claimed today's combo reward");
   }
 
   const combo = await getOrCreateTodayCombo(env, config);
@@ -2317,7 +2372,7 @@ async function handleRequestWithdrawal(env, ctx) {
   const telegramId = user.telegramId;
 
   if (config.withdrawalEnabled === false) {
-    return fail('السحب متوقف حاليًا، حاول مرة أخرى لاحقًا');
+    return fail('Withdrawals are currently disabled, please try again later');
   }
 
   const walletAddress = String(body.walletAddress || '').trim();
@@ -2327,7 +2382,7 @@ async function handleRequestWithdrawal(env, ctx) {
     return fail('Invalid TON wallet address. It must start with UQ or EQ.');
   }
   if (!Number.isFinite(amount) || amount <= 0) {
-    return fail('المبلغ غير صالح');
+    return fail('Invalid amount');
   }
 
   // قراءة رصيد لحظي (مش الرصيد المخزّن في initData القديم) لمنع التلاعب
@@ -2423,7 +2478,7 @@ async function handleCreateDeposit(env, ctx) {
   const amount = Number(body.amount);
   const txHash = String(body.txHash || '').trim();
   if (!Number.isFinite(amount) || amount <= 0 || !txHash) {
-    return fail('بيانات الإيداع غير مكتملة');
+    return fail('Incomplete deposit data');
   }
   const depositId = await dbPush(env, `deposits/${user.telegramId}`, {
     userId: String(user.telegramId),
@@ -2442,21 +2497,21 @@ async function handleCreateDeposit(env, ctx) {
 async function handleVerifyDeposit(env, ctx) {
   const { user, body } = ctx;
   const depositId = String(body.depositId || '').trim();
-  if (!depositId) return fail('معرّف الإيداع مفقود');
+  if (!depositId) return fail('Deposit ID missing');
   const path = `deposits/${user.telegramId}/${depositId}`;
   const deposit = await dbGet(env, path);
-  if (!deposit) return fail('الإيداع غير موجود', 404);
+  if (!deposit) return fail('Deposit not found', 404);
   if (deposit.status === 'completed') {
     const fresh = await dbGet(env, `users/${user.telegramId}`);
     return ok({ status: 'completed', amount: deposit.amount, tonBalance: Number(fresh?.tonBalance || 0) });
   }
-  if (!env.TONCENTER_API_KEY) return fail('TONCENTER_API_KEY مفقود من إعدادات السيرفر', 500);
+  if (!env.TONCENTER_API_KEY) return fail('TONCENTER_API_KEY missing from server configuration', 500);
 
   const response = await fetch(
     `https://toncenter.com/api/v2/getTransactions?address=${DEPOSIT_RECEIVER_WALLET}&limit=20`,
     { headers: { 'X-API-Key': env.TONCENTER_API_KEY } },
   );
-  if (!response.ok) return fail('تعذر التحقق من معاملة TON حاليًا', 502);
+  if (!response.ok) return fail('Unable to verify the TON transaction right now', 502);
   const data = await response.json();
   const found = (data.result || []).some((tx) => {
     const inMsg = tx.in_msg;
@@ -2488,7 +2543,7 @@ async function handleConvertPmtToTon(env, ctx) {
   const pmtAmount = Math.floor(Number(body.pmtAmount));
   const rate = Number(config.tonConversionRate || DEFAULT_CONFIG.tonConversionRate || 10000);
   if (!Number.isFinite(pmtAmount) || pmtAmount <= 0) {
-    return fail('المبلغ غير صالح');
+    return fail('Invalid amount');
   }
   const freshUser = await dbGet(env, `users/${user.telegramId}`);
   const pmtBalance = Number(freshUser?.balance || 0);
@@ -2546,7 +2601,7 @@ async function handleFetch(request, env) {
     }
 
     if (!env.FIREBASE_DATABASE_URL) {
-      return fail('السيرفر غير مُهيّأ بشكل صحيح: FIREBASE_DATABASE_URL مفقود من متغيرات البيئة', 500);
+      return fail('Server is not configured correctly: FIREBASE_DATABASE_URL is missing from environment variables', 500);
     }
 
     // ملف TonConnect عام، مطلوب قبل فتح نافذة ربط المحفظة.
@@ -2570,7 +2625,7 @@ async function handleFetch(request, env) {
     try {
       body = await request.json();
     } catch (_) {
-      return fail('Body غير صالح، يجب أن يكون JSON');
+      return fail('Invalid body, must be JSON');
     }
 
     if ((path === '/' || path === '') && body.action) {
@@ -2580,7 +2635,7 @@ async function handleFetch(request, env) {
 
     const handler = ROUTES[path];
     if (!handler) {
-      return fail('Endpoint غير موجود: ' + path, 404);
+      return fail('Endpoint not found: ' + path, 404);
     }
 
     let initData = '';
@@ -2598,7 +2653,7 @@ async function handleFetch(request, env) {
       || (forwardedFor ? forwardedFor.split(',')[0].trim() : '')
       || 'unknown';
     if (!checkRateLimit(ip)) {
-      return fail('تم تجاوز الحد المسموح من الطلبات، حاول لاحقًا', 429);
+      return fail('Rate limit exceeded, please try again later', 429);
     }
 
     // ───── تحميل الإعدادات من Firebase (تشمل botToken/botUsername الفعليين) ─────
@@ -2606,19 +2661,19 @@ async function handleFetch(request, env) {
     try {
       config = await getConfig(env);
     } catch (err) {
-      return fail('فشل تحميل الإعدادات من قاعدة البيانات: ' + err.message, 500);
+      return fail('Failed to load settings from the database: ' + err.message, 500);
     }
 
     const botToken = config.botToken || env.BOT_TOKEN || '';
     const botUsername = config.botUsername || env.BOT_USERNAME || 'Pmt_Gram_Bot';
 
     if (!botToken) {
-      return fail('لم يتم ضبط BOT_TOKEN (لا في Firebase config/botToken ولا في متغيرات البيئة)', 500);
+      return fail('BOT_TOKEN is not set (neither in Firebase config/botToken nor in environment variables)', 500);
     }
 
     const verification = await verifyTelegramInitData(initData, botToken);
     if (!verification.valid) {
-      return fail('غير مصرح: ' + verification.error, 401);
+      return fail('Unauthorized: ' + verification.error, 401);
     }
 
     try {
@@ -2656,7 +2711,7 @@ async function handleFetch(request, env) {
       const ctx = { user, body, tgUser: verification.user, config, botToken, botUsername, fraudResult, ip };
       return await handler(env, ctx);
     } catch (err) {
-      return fail('حدث خطأ في السيرفر: ' + err.message, 500);
+      return fail('A server error occurred: ' + err.message, 500);
     }
 }
 
@@ -2709,7 +2764,7 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     res.statusCode = 500;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.end(JSON.stringify({ success: false, error: 'حدث خطأ في السيرفر: ' + err.message, serverTime: Date.now() }));
+    res.end(JSON.stringify({ success: false, error: 'A server error occurred: ' + err.message, serverTime: Date.now() }));
   }
 });
 
