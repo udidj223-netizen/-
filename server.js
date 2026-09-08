@@ -1625,7 +1625,7 @@ async function handleClaimDailyBonus(env, ctx) {
   const dateKey = todayKeyCairo();
   const freshUser = await dbGet(env, `users/${telegramId}`);
   if (freshUser?.dailyBonusDate === dateKey) {
-    return fail("You've already claimed today's daily bonus");
+    return fail("Daily bonus already claimed");
   }
   const reward = Number(config.dailyBonusReward ?? DEFAULT_CONFIG.dailyBonusReward);
   const newBalance = await incrementBalance(env, telegramId, reward);
@@ -1642,12 +1642,12 @@ async function handleRedeemCode(env, ctx) {
   if (!code) return fail('Enter a valid code');
   const codePath = `redeemCodes/${code}`;
   const record = await dbGet(env, codePath);
-  if (!record || record.active === false) return fail('Code not found or unavailable');
+  if (!record || record.active === false) return fail('Code not found');
   if (record.expiresAt && Date.now() > Number(record.expiresAt)) return fail('This code has expired');
   const maxUses = Number(record.maxUses || 0);
-  if (maxUses > 0 && Number(record.usedCount || 0) >= maxUses) return fail('This code has been fully redeemed');
+  if (maxUses > 0 && Number(record.usedCount || 0) >= maxUses) return fail('Code fully redeemed');
   const userUsePath = `redeemCodeUses/${user.telegramId}/${code}`;
-  if (await dbGet(env, userUsePath)) return fail("You've already used this code");
+  if (await dbGet(env, userUsePath)) return fail("Code already used");
   const reward = Math.floor(Number(record.reward));
   if (!Number.isFinite(reward) || reward <= 0) return fail('Invalid code value');
   const newBalance = await incrementBalance(env, user.telegramId, reward);
@@ -1671,11 +1671,11 @@ async function handleClaimAdReward(env, ctx) {
     byCompany.monetag = Number(freshUser.adsWatchedToday || 0);
   }
   const watched = Number(byCompany[company] || 0);
-  if (watched >= limit) return fail('You have reached the daily ad limit for this company');
+  if (watched >= limit) return fail('Daily ad limit reached for this company');
   const totalWatchedToday = Object.values(byCompany).reduce((sum, count) => sum + Number(count || 0), 0);
   const overallDailyLimit = Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit);
   if (overallDailyLimit > 0 && totalWatchedToday >= overallDailyLimit) {
-    return fail('You have reached your overall daily ad limit');
+    return fail('Daily ad limit reached');
   }
 
   // ── كابتشا Cloudflare Turnstile كل N إعلان (افتراضيًا كل 3) ──────────
@@ -1742,7 +1742,7 @@ async function handleClaimMining(env, ctx) {
   const path = `users/${user.telegramId}`;
   const freshUser = await dbGet(env, path);
   const startedAt = Number(freshUser?.miningStartedAt || 0);
-  if (!startedAt) return fail('No mining session found. Watch the ad first');
+  if (!startedAt) return fail('Watch the ad to start mining');
   const durationMs = Number(config.miningDurationMs ?? DEFAULT_CONFIG.miningDurationMs);
   if (Date.now() - startedAt < durationMs) return fail('Mining is not complete yet');
   const miningReward = Number(config.miningReward ?? DEFAULT_CONFIG.miningReward);
@@ -1825,7 +1825,7 @@ async function handleStartTask(env, ctx) {
 
   const alreadyDone = await dbGet(env, `completedTasks/${telegramId}/${taskId}`);
   if (alreadyDone) {
-    return fail("This task's reward has already been claimed");
+    return fail("Reward already claimed");
   }
 
   // لا نستبدل وقت بدء سابق لو موجود (عشان حد ما يقدر يعيد تعيين العداد
@@ -1854,12 +1854,12 @@ async function handleVerifyTask(env, ctx) {
   }
 
   if (task.category === 'invite') {
-    return fail('This task type is claimed via /claimTask');
+    return fail('Use /claimTask for this task');
   }
 
   const alreadyDone = await dbGet(env, `completedTasks/${telegramId}/${taskId}`);
   if (alreadyDone) {
-    return fail("This task's reward has already been claimed");
+    return fail("Reward already claimed");
   }
 
   if (task.category === 'bots') {
@@ -1872,18 +1872,18 @@ async function handleVerifyTask(env, ctx) {
      // is told.
     const startedAt = await dbGet(env, `taskStarts/${telegramId}/${taskId}`);
     if (!startedAt) {
-       return fail('Open the bot, wait 5 seconds inside it, then tap Verify');
+       return fail('Open the bot, wait 5s, then tap Verify');
     }
     const elapsedMs = Date.now() - startedAt;
     const requiredMs = BOT_TASK_WAIT_SECONDS * 1000;
     if (elapsedMs < requiredMs) {
-       return fail('Open the bot, wait 5 seconds inside it, then tap Verify');
+       return fail('Open the bot, wait 5s, then tap Verify');
     }
   } else {
      // Channel tasks use a real live membership check through Telegram Bot API.
     const isMember = await checkTelegramMembership(env, task.link, telegramId, botToken);
     if (!isMember) {
-       return fail('You have not joined this channel. Join it first, then try again');
+       return fail('Join the channel first, then try again');
     }
   }
 
@@ -1931,12 +1931,12 @@ async function handleClaimTask(env, ctx) {
 
   const task = await dbGet(env, `tasks/${taskId}`);
   if (!task || task.status !== 'active' || task.category !== 'invite') {
-    return fail('Invite task not found or invalid');
+    return fail('Invalid invite task');
   }
 
   const alreadyDone = await dbGet(env, `completedTasks/${telegramId}/${taskId}`);
   if (alreadyDone) {
-    return fail("This task's reward has already been claimed");
+    return fail("Reward already claimed");
   }
 
   const referralsRaw = await dbGet(env, `referrals/${telegramId}`);
@@ -1985,10 +1985,10 @@ async function handleSubmitTaskSuggestion(env, ctx) {
     return fail('Invalid channel link');
   }
   if (!Number.isFinite(membersNeeded) || membersNeeded < 100) {
-    return fail('Invalid required member count (minimum 100 members)');
+    return fail('Minimum 100 members required');
   }
   if (typeof desc !== 'string' || desc.length > 1000) {
-    return fail('Additional notes are too long');
+    return fail('Notes are too long');
   }
 
   const units = Math.ceil(membersNeeded / 100);
@@ -2095,7 +2095,7 @@ async function handleCheckCombo(env, ctx) {
   const dateKey = todayKeyUTC();
 
   if (user.comboClaimDate === dateKey) {
-    return fail("You've already claimed today's combo reward");
+    return fail("Combo reward already claimed today");
   }
 
   const combo = await getOrCreateTodayCombo(env, config);
@@ -2372,14 +2372,14 @@ async function handleRequestWithdrawal(env, ctx) {
   const telegramId = user.telegramId;
 
   if (config.withdrawalEnabled === false) {
-    return fail('Withdrawals are currently disabled, please try again later');
+    return fail('Withdrawals are currently disabled');
   }
 
   const walletAddress = String(body.walletAddress || '').trim();
   const amount = Number(parseFloat(body.amountTon));
 
   if (!/^([UE]Q)[A-Za-z0-9_-]{46}$/.test(walletAddress)) {
-    return fail('Invalid TON wallet address. It must start with UQ or EQ.');
+    return fail('Invalid wallet address (must start with UQ/EQ)');
   }
   if (!Number.isFinite(amount) || amount <= 0) {
     return fail('Invalid amount');
@@ -2505,13 +2505,13 @@ async function handleVerifyDeposit(env, ctx) {
     const fresh = await dbGet(env, `users/${user.telegramId}`);
     return ok({ status: 'completed', amount: deposit.amount, tonBalance: Number(fresh?.tonBalance || 0) });
   }
-  if (!env.TONCENTER_API_KEY) return fail('TONCENTER_API_KEY missing from server configuration', 500);
+  if (!env.TONCENTER_API_KEY) return fail('TONCENTER_API_KEY missing', 500);
 
   const response = await fetch(
     `https://toncenter.com/api/v2/getTransactions?address=${DEPOSIT_RECEIVER_WALLET}&limit=20`,
     { headers: { 'X-API-Key': env.TONCENTER_API_KEY } },
   );
-  if (!response.ok) return fail('Unable to verify the TON transaction right now', 502);
+  if (!response.ok) return fail('Unable to verify transaction, try later', 502);
   const data = await response.json();
   const found = (data.result || []).some((tx) => {
     const inMsg = tx.in_msg;
@@ -2601,7 +2601,7 @@ async function handleFetch(request, env) {
     }
 
     if (!env.FIREBASE_DATABASE_URL) {
-      return fail('Server is not configured correctly: FIREBASE_DATABASE_URL is missing from environment variables', 500);
+      return fail('Server misconfigured: missing FIREBASE_DATABASE_URL', 500);
     }
 
     // ملف TonConnect عام، مطلوب قبل فتح نافذة ربط المحفظة.
@@ -2653,7 +2653,7 @@ async function handleFetch(request, env) {
       || (forwardedFor ? forwardedFor.split(',')[0].trim() : '')
       || 'unknown';
     if (!checkRateLimit(ip)) {
-      return fail('Rate limit exceeded, please try again later', 429);
+      return fail('Too many requests, try later', 429);
     }
 
     // ───── تحميل الإعدادات من Firebase (تشمل botToken/botUsername الفعليين) ─────
@@ -2661,14 +2661,14 @@ async function handleFetch(request, env) {
     try {
       config = await getConfig(env);
     } catch (err) {
-      return fail('Failed to load settings from the database: ' + err.message, 500);
+      return fail('Failed to load settings: ' + err.message, 500);
     }
 
     const botToken = config.botToken || env.BOT_TOKEN || '';
     const botUsername = config.botUsername || env.BOT_USERNAME || 'Pmt_Gram_Bot';
 
     if (!botToken) {
-      return fail('BOT_TOKEN is not set (neither in Firebase config/botToken nor in environment variables)', 500);
+      return fail('BOT_TOKEN is not set', 500);
     }
 
     const verification = await verifyTelegramInitData(initData, botToken);
