@@ -2409,7 +2409,9 @@ async function handleRequestWithdrawal(env, ctx) {
   if (freshUser?.adWatchDate === today && !Object.keys(adsByCompanyToday).length && freshUser.adsWatchedToday) {
     adsByCompanyToday.monetag = Number(freshUser.adsWatchedToday || 0);
   }
-  const watchedAds = Object.values(adsByCompanyToday).reduce((sum, count) => sum + Number(count || 0), 0);
+  // شرط السحب بيعتمد على إعلانات AdsGram بس؛ باقي الشركات (monetag, adexium)
+  // بتضاف للرصيد لكن مبتحتسبش ضمن عدد الإعلانات المطلوب للسحب.
+  const watchedAds = Number(adsByCompanyToday.adsgram || 0);
   const previousWithdrawals = await dbGet(env, `withdrawals/${telegramId}`);
   const withdrawalCount = previousWithdrawals ? Object.keys(previousWithdrawals).length : 0;
   const withdrawalRules = [
