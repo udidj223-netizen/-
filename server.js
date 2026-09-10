@@ -1620,7 +1620,17 @@ function todayKeyCairoFromTimestamp(ts) {
   }).format(new Date(Number(ts)));
 }
 
-// ───────────────────────── POST /claimDailyBonus ───────────────────────
+// ───────────────────────── POST /heartbeat ─────────────────────────
+// الفرونت إند بيبعت الطلب ده كل 25 ثانية (startHeartbeat) عشان يعلّم إن
+// المستخدم "أونلاين" دلوقتي. مكانش فيه راوت مسجَّل لـ /heartbeat أصلًا،
+// فكان بيرجع 404 كل شوية في الـ Console. مجرد تحديث بسيط لوقت آخر ظهور،
+// من غير أي منطق تاني (مفيش مكافآت هنا).
+async function handleHeartbeat(env, ctx) {
+  const { user } = ctx;
+  await dbUpdate(env, `users/${user.telegramId}`, { lastActiveAt: Date.now() });
+  return ok({ ok: true });
+}
+
 async function handleClaimDailyBonus(env, ctx) {
   const { user, config } = ctx;
   const telegramId = user.telegramId;
@@ -2573,6 +2583,7 @@ async function handleConvertPmtToTon(env, ctx) {
 // ════════════════════════════════════════════════════════════════════
 const ROUTES = {
   '/getState': handleGetState,
+  '/heartbeat': handleHeartbeat,
   '/claimDailyBonus': handleClaimDailyBonus,
   '/redeemCode': handleRedeemCode,
   '/claimAdReward': handleClaimAdReward,
