@@ -66,6 +66,7 @@ const DEFAULT_CONFIG = {
   adCompanies: {
     monetag: { reward: 200, dailyLimit: 10 },
     adsgram: { reward: 200, dailyLimit: 10 },
+    adexium: { reward: 200, dailyLimit: 10 },
   },
   minWithdrawal: 50000,        // أقل مبلغ يمكن سحبه (SHIBA)
   tonConversionRate: 10000,    // 10,000 PMT = 1 TON
@@ -1017,6 +1018,7 @@ async function findUserByReferralCode(env, code) {
 const COMPANY_ALIASES = {
   monetag: ['monetag', 'montag'], // "montag" كان الخطأ الإملائي اللي سبب المشكلة
   adsgram: ['adsgram'],
+  adexium: ['adexium', 'adexuim'],
 };
 
 function findCompanyNode(adCompanies, company) {
@@ -1661,7 +1663,9 @@ async function handleClaimAdReward(env, ctx) {
   const { user, config, body } = ctx;
   const today = todayKeyCairo();
   const freshUser = await dbGet(env, `users/${user.telegramId}`);
-  const company = body.company === 'adsgram' ? 'adsgram' : 'monetag';
+  const company = ['adsgram', 'adexium', 'monetag'].includes(String(body.company || '').toLowerCase())
+    ? String(body.company).toLowerCase()
+    : 'monetag';
   const companyConfig = getAdCompanyConfig(config, company);
   const limit = companyConfig.dailyLimit;
   const byCompany = freshUser?.adWatchDate === today
