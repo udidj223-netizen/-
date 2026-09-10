@@ -2414,7 +2414,7 @@ async function handleRequestWithdrawal(env, ctx) {
     return fail('Insufficient TON balance.');
   }
 
-  const feeRate = 0.05;
+  const feeRate = 0.10;
   const fee = Number((amount * feeRate).toFixed(4));
   const netAmount = Number((amount - fee).toFixed(4));
   const newBalance = balance - amount;
