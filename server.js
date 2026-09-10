@@ -1758,7 +1758,7 @@ async function handlePlayGame(env, ctx) {
   const { user, body, config } = ctx;
   const telegramId = user.telegramId;
   const game = String(body.game || '');
-  const maxRewards = { gem: 100, wheel: 81, xo: 20, fruit: 100 };
+  const maxRewards = { gem: 30, wheel: 36, xo: 10, fruit: 20 };
   const allowed = Object.keys(maxRewards);
   if (!allowed.includes(game)) return fail('Invalid game');
 
