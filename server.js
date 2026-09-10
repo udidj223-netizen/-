@@ -1018,7 +1018,7 @@ async function findUserByReferralCode(env, code) {
 const COMPANY_ALIASES = {
   monetag: ['monetag', 'montag'], // "montag" كان الخطأ الإملائي اللي سبب المشكلة
   adsgram: ['adsgram'],
-  adexium: ['adexium', 'adexuim'],
+  adexium: ['adexium'],
 };
 
 function findCompanyNode(adCompanies, company) {
@@ -1663,8 +1663,8 @@ async function handleClaimAdReward(env, ctx) {
   const { user, config, body } = ctx;
   const today = todayKeyCairo();
   const freshUser = await dbGet(env, `users/${user.telegramId}`);
-  const company = ['adsgram', 'adexium', 'monetag'].includes(String(body.company || '').toLowerCase())
-    ? String(body.company).toLowerCase()
+  const company = body.company === 'adsgram' ? 'adsgram'
+    : body.company === 'adexium' ? 'adexium'
     : 'monetag';
   const companyConfig = getAdCompanyConfig(config, company);
   const limit = companyConfig.dailyLimit;
