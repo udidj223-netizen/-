@@ -1021,7 +1021,7 @@ const COMPANY_ALIASES = {
   adsgram: ['adsgram'],
   // Adexium هو الاسم القديم. الاسم الموحد في البيانات والواجهة هو USL.
   usl: ['usl', 'adexium', 'towerads', 'tower_ads'],
-  gigapub: ['gigapub'],
+  gigapub: ['gigapub', 'giga', 'gigapub.tech'],
 };
 
 function canonicalAdCompany(company) {
