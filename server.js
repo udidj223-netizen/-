@@ -66,8 +66,7 @@ const DEFAULT_CONFIG = {
   adCompanies: {
     monetag: { reward: 200, dailyLimit: 10 },
     adsgram: { reward: 200, dailyLimit: 10 },
-    adexium: { reward: 200, dailyLimit: 10 },
-    towerads: { reward: 200, dailyLimit: 10 },
+    usl: { reward: 200, dailyLimit: 10 },
   },
   minWithdrawal: 50000,        // أقل مبلغ يمكن سحبه (SHIBA)
   tonConversionRate: 10000,    // 10,000 PMT = 1 TON
@@ -1019,16 +1018,25 @@ async function findUserByReferralCode(env, code) {
 const COMPANY_ALIASES = {
   monetag: ['monetag', 'montag'], // "montag" كان الخطأ الإملائي اللي سبب المشكلة
   adsgram: ['adsgram'],
-  adexium: ['adexium'],
-  towerads: ['towerads', 'tower_ads', 'toweradsusl', 'usl'],
+  // Adexium هو الاسم القديم. الاسم الموحد في البيانات والواجهة هو USL.
+  usl: ['usl', 'adexium', 'towerads', 'tower_ads'],
 };
+
+function canonicalAdCompany(company) {
+  const normalized = String(company || '').trim().toLowerCase();
+  if (normalized === 'adsgram') return 'adsgram';
+  if (normalized === 'monetag' || normalized === 'montag') return 'monetag';
+  if (COMPANY_ALIASES.usl.includes(normalized)) return 'usl';
+  return 'monetag';
+}
 
 function findCompanyNode(adCompanies, company) {
   if (!adCompanies) return {};
-  // 1) تطابق مباشر بالاسم الصحيح
-  if (adCompanies[company]) return adCompanies[company];
 
-  const aliases = COMPANY_ALIASES[company] || [company];
+  const canonical = canonicalAdCompany(company);
+  const aliases = COMPANY_ALIASES[canonical] || [canonical];
+  // 1) تطابق مباشر بالاسم الموحد
+  if (adCompanies[canonical]) return adCompanies[canonical];
 
   // 2) تطابق مع أي alias معروف (بالاسم بالظبط)
   for (const alias of aliases) {
@@ -1048,25 +1056,55 @@ function findCompanyNode(adCompanies, company) {
 }
 
 function getAdCompanyConfig(config, company) {
-  const perCompany = findCompanyNode(config.adCompanies, company);
-  const reward = Number(
+  const canonical = canonicalAdCompany(company);
+  const perCompany = findCompanyNode(config.adCompanies, canonical);
+  const rewardValue = Number(
     perCompany.reward ?? config.adReward ?? DEFAULT_CONFIG.adReward
   );
-  const dailyLimit = Number(
+  const limitValue = Number(
     perCompany.dailyLimit ?? config.adCompanyDailyLimit ?? DEFAULT_CONFIG.adCompanyDailyLimit
   );
+  const reward = Number.isFinite(rewardValue) && rewardValue > 0
+    ? Math.floor(rewardValue)
+    : DEFAULT_CONFIG.adReward;
+  const dailyLimit = Number.isFinite(limitValue) && limitValue >= 0
+    ? Math.floor(limitValue)
+    : DEFAULT_CONFIG.adCompanyDailyLimit;
   return { reward, dailyLimit };
 }
 
-// يرجّع إعدادات كل الشركات المعروفة (مفيد لعرضها في الواجهة/لوحة التحكم)
-// ملاحظة: بنستخدم الأسماء "الصحيحة" فقط (من DEFAULT_CONFIG.adCompanies و
-// COMPANY_ALIASES) عشان أي نود بالغلط الإملائي زي "montag" ميظهرش كشركة
-// مستقلة تكرارية جنب "monetag" — findCompanyNode أصلاً هيلاقي بياناته
-// تلقائيًا تحت الاسم الصحيح.
+// يحول العدادات القديمة (ومنها adexium) إلى الشكل الموحد الذي تعرضه الواجهة.
+// لو كانت قاعدة البيانات تحتوي أكثر من alias لنفس الشركة، نستخدم الأكبر
+// بدل جمعها حتى لا يتكرر نفس العداد بعد أي ترحيل سابق.
+function normalizeAdWatchCounters(rawCounters, legacyTotal = 0) {
+  const result = {};
+  if (rawCounters && typeof rawCounters === 'object') {
+    for (const [key, value] of Object.entries(rawCounters)) {
+      const canonical = canonicalAdCompany(key);
+      const count = Math.max(0, Number(value || 0));
+      result[canonical] = Math.max(result[canonical] || 0, count);
+    }
+  }
+  // users created before per-company counters existed had only this field.
+  // Keep the old behavior as a safe migration path instead of losing progress.
+  if (!Object.keys(result).length && Number(legacyTotal || 0) > 0) {
+    result.monetag = Math.max(0, Number(legacyTotal || 0));
+  }
+  return result;
+}
+
+function totalAdWatchCounters(counters) {
+  return Object.values(counters || {})
+    .reduce((sum, count) => sum + Math.max(0, Number(count || 0)), 0);
+}
+
+// يرجّع إعدادات كل الشركات المعروفة بأسماء ثابتة للواجهة.
 function getAllAdCompaniesConfig(config) {
   const known = new Set([
     ...Object.keys(DEFAULT_CONFIG.adCompanies || {}),
-    ...Object.keys(COMPANY_ALIASES || {}),
+    'monetag',
+    'adsgram',
+    'usl',
   ]);
   const result = {};
   for (const company of known) {
@@ -1425,7 +1463,11 @@ function isValidBep20Address(addr) {
 
 // ───────────────────────── POST /getState ─────────────────────────
 async function handleGetState(env, ctx) {
-  const { user, config, botToken } = ctx;
+  const { config, botToken } = ctx;
+  // اقرأ المستخدم مرة أخرى عند فتح الصفحة. ctx.user تم تحميله قبل بعض
+  // عمليات التهيئة، وقد يكون أقدم من القيمة الموجودة فعليًا في Firebase
+  // (خصوصًا بعد مشاهدة إعلان من جلسة أخرى).
+  const user = await dbGet(env, `users/${ctx.user.telegramId}`).catch(() => ctx.user);
   const telegramId = user.telegramId;
 
   const [tasksRaw, completedRaw, referralsRaw, logsRaw, withdrawalsRaw, gamePlaysRaw] = await Promise.all([
@@ -1519,13 +1561,9 @@ async function handleGetState(env, ctx) {
   });
   const dailyBonusClaimed = user.dailyBonusDate === today;
   const adsByCompany = user.adWatchDate === today
-    ? { ...(user.adsWatchedByCompany || {}) }
+    ? normalizeAdWatchCounters(user.adsWatchedByCompany, user.adsWatchedToday)
     : {};
-  if (user.adWatchDate === today && !Object.keys(adsByCompany).length && user.adsWatchedToday) {
-    adsByCompany.monetag = Number(user.adsWatchedToday || 0);
-  }
-  const adsWatchedToday = Object.values(adsByCompany)
-    .reduce((sum, count) => sum + Number(count || 0), 0);
+  const adsWatchedToday = totalAdWatchCounters(adsByCompany);
   const adCompaniesConfig = getAllAdCompaniesConfig(config);
   const adCompanyDailyLimit = Number(config.adCompanyDailyLimit ?? DEFAULT_CONFIG.adCompanyDailyLimit);
   const earnedToday = todayLogs
@@ -1576,6 +1614,7 @@ async function handleGetState(env, ctx) {
       adCompanies: adCompaniesConfig,   // { monetag: {reward, dailyLimit}, adsgram: {...}, ... } لكل شركة
       adCompanyDailyLimit,
       adDailyTotalLimit: Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit),
+      statsDate: today,
       friendsInvited: referrals.length,
       earnedToday,
     },
@@ -1675,21 +1714,15 @@ async function handleClaimAdReward(env, ctx) {
   const { user, config, body } = ctx;
   const today = todayKeyCairo();
   const freshUser = await dbGet(env, `users/${user.telegramId}`);
-  const company = body.company === 'adsgram' ? 'adsgram'
-    : body.company === 'adexium' ? 'adexium'
-    : body.company === 'towerads' ? 'towerads'
-    : 'monetag';
+  const company = canonicalAdCompany(body.company);
   const companyConfig = getAdCompanyConfig(config, company);
   const limit = companyConfig.dailyLimit;
   const byCompany = freshUser?.adWatchDate === today
-    ? { ...(freshUser.adsWatchedByCompany || {}) }
+    ? normalizeAdWatchCounters(freshUser.adsWatchedByCompany, freshUser.adsWatchedToday)
     : {};
-  if (freshUser?.adWatchDate === today && !Object.keys(byCompany).length && freshUser.adsWatchedToday) {
-    byCompany.monetag = Number(freshUser.adsWatchedToday || 0);
-  }
   const watched = Number(byCompany[company] || 0);
-  if (watched >= limit) return fail('Daily ad limit reached for this company');
-  const totalWatchedToday = Object.values(byCompany).reduce((sum, count) => sum + Number(count || 0), 0);
+  if (limit > 0 && watched >= limit) return fail('Daily ad limit reached for this company');
+  const totalWatchedToday = totalAdWatchCounters(byCompany);
   const overallDailyLimit = Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit);
   if (overallDailyLimit > 0 && totalWatchedToday >= overallDailyLimit) {
     return fail('Daily ad limit reached');
@@ -1716,7 +1749,7 @@ async function handleClaimAdReward(env, ctx) {
   await dbUpdate(env, `users/${user.telegramId}`, {
     adWatchDate: today,
     adsWatchedByCompany: byCompany,
-    adsWatchedToday: Object.values(byCompany).reduce((sum, count) => sum + Number(count || 0), 0),
+    adsWatchedToday: totalAdWatchCounters(byCompany),
     totalAdsWatched: Number(freshUser?.totalAdsWatched || 0) + 1,
   });
   await addBalanceLog(env, user.telegramId, { type: 'ad_reward', amount: reward, date: today, ts: Date.now() });
@@ -1727,8 +1760,9 @@ async function handleClaimAdReward(env, ctx) {
     shibaBalance: newBalance,
     shibaAdded: reward,
     company,
-    adsWatchedToday: Object.values(byCompany).reduce((sum, count) => sum + Number(count || 0), 0),
+    adsWatchedToday: totalAdWatchCounters(byCompany),
     adsWatchedByCompany: byCompany,
+    adCompanies: getAllAdCompaniesConfig(config),
     adCompanyDailyLimit: limit,
     adDailyTotalLimit: Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit),
   });
@@ -2407,13 +2441,10 @@ async function handleRequestWithdrawal(env, ctx) {
   const balance = Number(freshUser?.tonBalance || 0);
   const today = todayKeyCairo();
   const adsByCompanyToday = freshUser?.adWatchDate === today
-    ? { ...(freshUser.adsWatchedByCompany || {}) }
+    ? normalizeAdWatchCounters(freshUser.adsWatchedByCompany, freshUser.adsWatchedToday)
     : {};
-  if (freshUser?.adWatchDate === today && !Object.keys(adsByCompanyToday).length && freshUser.adsWatchedToday) {
-    adsByCompanyToday.monetag = Number(freshUser.adsWatchedToday || 0);
-  }
   // شرط السحب بيعتمد فقط على عدد إعلانات Adsgram (الشركات التانية زي
-  // monetag و adexium بتفضل تدي مكافأة عادية للمستخدم، لكن مبتتحسبش في
+  // monetag و usl بتفضل تدي مكافأة عادية للمستخدم، لكن مبتتحسبش في
   // شرط عدد الإعلانات المطلوب قبل السحب)
   const watchedAds = Number(adsByCompanyToday.adsgram || 0);
   const previousWithdrawals = await dbGet(env, `withdrawals/${telegramId}`);
