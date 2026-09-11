@@ -67,6 +67,7 @@ const DEFAULT_CONFIG = {
     monetag: { reward: 200, dailyLimit: 10 },
     adsgram: { reward: 200, dailyLimit: 10 },
     usl: { reward: 200, dailyLimit: 10 },
+    gigapub: { reward: 200, dailyLimit: 10 },
   },
   minWithdrawal: 50000,        // أقل مبلغ يمكن سحبه (SHIBA)
   tonConversionRate: 10000,    // 10,000 PMT = 1 TON
@@ -1020,6 +1021,7 @@ const COMPANY_ALIASES = {
   adsgram: ['adsgram'],
   // Adexium هو الاسم القديم. الاسم الموحد في البيانات والواجهة هو USL.
   usl: ['usl', 'adexium', 'towerads', 'tower_ads'],
+  gigapub: ['gigapub'],
 };
 
 function canonicalAdCompany(company) {
@@ -1027,6 +1029,7 @@ function canonicalAdCompany(company) {
   if (normalized === 'adsgram') return 'adsgram';
   if (normalized === 'monetag' || normalized === 'montag') return 'monetag';
   if (COMPANY_ALIASES.usl.includes(normalized)) return 'usl';
+  if (COMPANY_ALIASES.gigapub.includes(normalized)) return 'gigapub';
   return 'monetag';
 }
 
@@ -1105,6 +1108,7 @@ function getAllAdCompaniesConfig(config) {
     'monetag',
     'adsgram',
     'usl',
+    'gigapub',
   ]);
   const result = {};
   for (const company of known) {
