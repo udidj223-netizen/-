@@ -66,7 +66,6 @@ const DEFAULT_CONFIG = {
   adCompanies: {
     monetag: { reward: 200, dailyLimit: 10 },
     adsgram: { reward: 200, dailyLimit: 10 },
-    usl: { reward: 200, dailyLimit: 10 },
     gigapub: { reward: 200, dailyLimit: 10 },
   },
   minWithdrawal: 50000,        // أقل مبلغ يمكن سحبه (SHIBA)
@@ -1019,8 +1018,6 @@ async function findUserByReferralCode(env, code) {
 const COMPANY_ALIASES = {
   monetag: ['monetag', 'montag'], // "montag" كان الخطأ الإملائي اللي سبب المشكلة
   adsgram: ['adsgram'],
-  // Adexium هو الاسم القديم. الاسم الموحد في البيانات والواجهة هو USL.
-  usl: ['usl', 'adexium', 'towerads', 'tower_ads'],
   gigapub: ['gigapub', 'giga', 'gigapub.tech'],
 };
 
@@ -1028,7 +1025,6 @@ function canonicalAdCompany(company) {
   const normalized = String(company || '').trim().toLowerCase();
   if (normalized === 'adsgram') return 'adsgram';
   if (normalized === 'monetag' || normalized === 'montag') return 'monetag';
-  if (COMPANY_ALIASES.usl.includes(normalized)) return 'usl';
   if (COMPANY_ALIASES.gigapub.includes(normalized)) return 'gigapub';
   return 'monetag';
 }
@@ -1076,7 +1072,7 @@ function getAdCompanyConfig(config, company) {
   return { reward, dailyLimit };
 }
 
-// يحول العدادات القديمة (ومنها adexium) إلى الشكل الموحد الذي تعرضه الواجهة.
+// يحول العدادات القديمة إلى الشكل الموحد الذي تعرضه الواجهة.
 // لو كانت قاعدة البيانات تحتوي أكثر من alias لنفس الشركة، نستخدم الأكبر
 // بدل جمعها حتى لا يتكرر نفس العداد بعد أي ترحيل سابق.
 function normalizeAdWatchCounters(rawCounters, legacyTotal = 0) {
@@ -1107,7 +1103,6 @@ function getAllAdCompaniesConfig(config) {
     ...Object.keys(DEFAULT_CONFIG.adCompanies || {}),
     'monetag',
     'adsgram',
-    'usl',
     'gigapub',
   ]);
   const result = {};
@@ -2448,7 +2443,7 @@ async function handleRequestWithdrawal(env, ctx) {
     ? normalizeAdWatchCounters(freshUser.adsWatchedByCompany, freshUser.adsWatchedToday)
     : {};
   // شرط السحب بيعتمد فقط على عدد إعلانات Adsgram (الشركات التانية زي
-  // monetag و usl بتفضل تدي مكافأة عادية للمستخدم، لكن مبتتحسبش في
+  // monetag و gigapub بتفضل تدي مكافأة عادية للمستخدم، لكن مبتتحسبش في
   // شرط عدد الإعلانات المطلوب قبل السحب)
   const watchedAds = Number(adsByCompanyToday.adsgram || 0);
   const previousWithdrawals = await dbGet(env, `withdrawals/${telegramId}`);
