@@ -67,6 +67,7 @@ const DEFAULT_CONFIG = {
     monetag: { reward: 200, dailyLimit: 10 },
     adsgram: { reward: 200, dailyLimit: 10 },
     gigapub: { reward: 200, dailyLimit: 10 },
+    monetix: { reward: 200, dailyLimit: 10 },
   },
   minWithdrawal: 50000,        // أقل مبلغ يمكن سحبه (SHIBA)
   tonConversionRate: 10000,    // 10,000 PMT = 1 TON
@@ -1019,6 +1020,7 @@ const COMPANY_ALIASES = {
   monetag: ['monetag', 'montag'], // "montag" كان الخطأ الإملائي اللي سبب المشكلة
   adsgram: ['adsgram'],
   gigapub: ['gigapub', 'giga', 'gigapub.tech'],
+  monetix: ['monetix', 'monetixads'],
 };
 
 function canonicalAdCompany(company) {
@@ -1026,6 +1028,7 @@ function canonicalAdCompany(company) {
   if (normalized === 'adsgram') return 'adsgram';
   if (normalized === 'monetag' || normalized === 'montag') return 'monetag';
   if (COMPANY_ALIASES.gigapub.includes(normalized)) return 'gigapub';
+  if (COMPANY_ALIASES.monetix.includes(normalized)) return 'monetix';
   return 'monetag';
 }
 
@@ -1104,6 +1107,7 @@ function getAllAdCompaniesConfig(config) {
     'monetag',
     'adsgram',
     'gigapub',
+    'monetix',
   ]);
   const result = {};
   for (const company of known) {
