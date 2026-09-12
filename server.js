@@ -723,6 +723,38 @@ async function getConfig(env) {
       changed = true;
     }
   }
+
+  // ── إعدادات كل شركة إعلانات (config/adCompanies/<company>) ──────────
+  // الحلقة اللي فوق بتضيف "adCompanies" كامل مرة واحدة بس لو مش موجود
+  // خالص. لكن لو config/adCompanies كان موجود بالفعل من قبل (زي أي
+  // مشروع شغّال) وبعدين ضفنا شركة جديدة (زي monetix) في DEFAULT_CONFIG،
+  // الحلقة مش هتلاحظها لأن adCompanies نفسه مش undefined. عشان كده هنا
+  // بنتأكد إن كل شركة معروفة في DEFAULT_CONFIG.adCompanies موجودة فعليًا
+  // كنود مستقل جوه config.adCompanies في Firebase، ولو ناقصة بنضيفها
+  // بالقيم الافتراضية ونحفظها — من غير ما نلمس أي شركة موجودة بالفعل
+  // (حتى لو قيمها مختلفة عن الافتراضي).
+  if (!config.adCompanies || typeof config.adCompanies !== 'object') {
+    config.adCompanies = {};
+    changed = true;
+  }
+  for (const [company, defaults] of Object.entries(DEFAULT_CONFIG.adCompanies || {})) {
+    if (!config.adCompanies[company] || typeof config.adCompanies[company] !== 'object') {
+      config.adCompanies[company] = { ...defaults };
+      changed = true;
+    } else {
+      // النود موجود لكن ممكن ينقصه reward أو dailyLimit بس (مثلًا لو
+      // اتضاف يدويًا في Firebase بحقل واحد فقط)، فبنكمل الناقص فقط.
+      if (config.adCompanies[company].reward === undefined) {
+        config.adCompanies[company].reward = defaults.reward;
+        changed = true;
+      }
+      if (config.adCompanies[company].dailyLimit === undefined) {
+        config.adCompanies[company].dailyLimit = defaults.dailyLimit;
+        changed = true;
+      }
+    }
+  }
+
   // اسم البوت ثابت هنا حتى لا تستمر روابط الإحالة في استخدام اسم قديم
   // محفوظ في Firebase أو في متغيرات البيئة.
   if (config.botUsername !== DEFAULT_CONFIG.botUsername) {
