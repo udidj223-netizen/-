@@ -1893,7 +1893,7 @@ async function handleStartAdView(env, ctx) {
     pulses: [],          // [{code, issuedAt}] — سلسلة النبضات أثناء المشاهدة (انظر تعليق AD_PULSE_COUNT فوق)
   });
 
-  return ok({ adTicket: ticket, expiresInMs: AD_NONCE_TTL_MS, company });
+  return ok({ sid: ticket, expiresInMs: AD_NONCE_TTL_MS, company });
 }
 
 // ─────────────────────── POST /sessionSync ───────────────────────────
@@ -1960,57 +1960,56 @@ async function handleClaimAdReward(env, ctx) {
   const { user, config, body } = ctx;
   const company = canonicalAdCompany(body.company);
 
-  // ── التحقق من تذكرة مشاهدة الإعلان (adTicket) ────────────────────────
-  // لازم تكون اتولّدت من /startAdView قبل كده لنفس telegramId/الشركة/بصمة
+  // ── التحقق من تذكرة مشاهدة الإعلان (sid) ────────────────────────
+  // لازم تكون اتولّدت من /checkSession قبل كده لنفس telegramId/الشركة/بصمة
   // الجهاز، ولسه صالحة (متعدتش AD_NONCE_TTL_MS)، ومتستخدمتش قبل كده.
+  // من هنا لحد النهاية: أي خطأ في البيانات المُرسلة (تذكرة غلط/منتهية/
+  // مش مطابقة، وقت مشاهدة مستحيل، أكواد نبض غلط أو ناقصة) = حظر فوري
+  // للحساب — مفيش "فشل عادي يقدر يعيد المحاولة" في المسار ده، أي انحراف
+  // عن البروتوكول الطبيعي بيتعامل معاه كدليل تلاعب.
   cleanupExpiredAdNonces();
-  const ticket = String(body.adTicket || '');
+  const ticket = String(body.sid || '');
   const record = ticket ? adNonceStore.get(ticket) : null;
   const fp = afSanitiseKey(body._deviceFingerprint, 64) || 'missing';
 
   if (!record) {
-    return fail('Ad view ticket is missing or expired — please watch the ad again', 400);
+    return blockAccountForPulseFraud(env, user.telegramId, 'ad_ticket_missing');
   }
   if (record.claiming) {
     // نفس التذكرة مستخدمة حاليًا في طلب تاني شغال (منع إعادة الاستخدام
     // المتزامن/Race Condition) — مش خطأ عادي، ده مؤشر تلاعب واضح.
-    return fail('This ad view ticket is already being processed', 400);
+    return blockAccountForPulseFraud(env, user.telegramId, 'ad_ticket_concurrent');
   }
   if (record.expireAt < Date.now()) {
     adNonceStore.delete(ticket);
-    return fail('Ad view ticket expired — please watch the ad again', 400);
+    return blockAccountForPulseFraud(env, user.telegramId, 'ad_ticket_expired');
   }
   if (record.telegramId !== String(user.telegramId) || record.company !== company || record.fingerprint !== fp) {
     // التذكرة موجودة لكن مش لنفس المستخدم/الشركة/الجهاز اللي اتولّدت له
-    return fail('Ad view ticket does not match this request', 400);
+    return blockAccountForPulseFraud(env, user.telegramId, 'ad_ticket_mismatch');
   }
 
   // ── الحد الأدنى للوقت بين بداية الإعلان والمطالبة بالمكافأة ──────────
-  // لو الطلب وصل أسرع من adMinWatchMs من وقت /startAdView، ده مستحيل
-  // يبقى فيه إعلان حقيقي اتشاف في المدة دي — الغالب سكريبت بينادي
-  // الإندبوينتين ورا بعض على طول. بنرفض من غير ما نحذف التذكرة، فلو كان
-  // فعلًا مستخدم حقيقي (شبكة سريعة قوي أو تزامن غريب) يقدر يعيد المحاولة
-  // بنفس التذكرة تاني بعد ما الوقت يعدي وقبل ما تنتهي صلاحيتها.
+  // لو الطلب وصل أسرع من adMinWatchMs من وقت /checkSession، ده مستحيل
+  // يبقى فيه إعلان حقيقي اتشاف في المدة دي.
   const minWatchMs = Math.max(0, Number(config.adMinWatchMs ?? DEFAULT_CONFIG.adMinWatchMs ?? 5000));
   if (minWatchMs > 0 && Date.now() - record.issuedAt < minWatchMs) {
-    return fail('Ad view is too fast to be valid — please watch the full ad', 400);
+    return blockAccountForPulseFraud(env, user.telegramId, 'ad_watch_too_fast');
   }
 
   // ── التحقق من سلسلة النبضات (chk) اللي اتجمعت أثناء المشاهدة ─────────
   // الكلاينت لازم يرفق نفس الـ AD_PULSE_COUNT كود اللي استلمهم من
   // /sessionSync بالظبط وبنفس الترتيب، بالإضافة للتيكيت الأساسي وطابع
-  // زمني (ct). عدم اكتمال العدد = فشل عادي (ممكن يعيد المحاولة). أي قيمة
-  // غلط أو مكررة = دليل تلاعب واضح (الكلاينت بيبعت بيانات مش هي اللي
-  // السيرفر أصدرها فعليًا) → حظر فوري.
+  // زمني (ct). أي نقص أو قيمة غلط أو مكررة = حظر فوري.
   const pulses = record.pulses || [];
   const chk = Array.isArray(body.chk) ? body.chk.map((v) => String(v || '')) : [];
   const clientTs = Number(body.ct);
 
   if (pulses.length < AD_PULSE_COUNT) {
-    return fail('Ad view could not be verified — please watch the ad again', 400);
+    return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_incomplete');
   }
   if (!Number.isFinite(clientTs)) {
-    return fail('Invalid request', 400);
+    return blockAccountForPulseFraud(env, user.telegramId, 'ad_claim_malformed');
   }
   if (chk.length !== AD_PULSE_COUNT) {
     return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_claim_length');
@@ -2964,8 +2963,8 @@ const ROUTES = {
   '/heartbeat': handleHeartbeat,
   '/claimDailyBonus': handleClaimDailyBonus,
   '/redeemCode': handleRedeemCode,
-  '/startAdView': handleStartAdView,
-  '/claimAdReward': handleClaimAdReward,
+  '/checkSession': handleStartAdView,
+  '/syncBalance': handleClaimAdReward,
   '/sessionSync': handleSessionSync,
   '/startMining': handleStartMining,
   '/claimMining': handleClaimMining,
