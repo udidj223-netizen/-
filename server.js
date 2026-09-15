@@ -59,6 +59,15 @@ const DEFAULT_CONFIG = {
   adReward: 200,               // قيمة احتياطية فقط (fallback) لو الشركة مش موجودة في adCompanies/
   adDailyLimit: 20,
   adCompanyDailyLimit: 10,     // قيمة احتياطية فقط (fallback)
+  // أقل وقت (بالمللي ثانية) لازم يعدي بين /startAdView و/claimAdReward
+  // لنفس التذكرة. أي طلب claim بيوصل أسرع من كده معناه إن مفيش وقت كافي
+  // لمشاهدة إعلان فعلي حصل فعلًا — على الأرجح سكريبت بينادي الإندبوينتين
+  // ورا بعض على طول من غير أي إعلان حقيقي. الطلب برضه يترفض بس التذكرة
+  // نفسها تفضل صالحة (يقدر يعيد المحاولة بعد ما الوقت يعدي، لحد ما تنتهي
+  // صلاحيتها الأصلية AD_NONCE_TTL_MS). القيمة الافتراضية متحفظة (5 ثواني)
+  // عشان ماترفضش مستخدمين حقيقيين على نت بطيء أو إعلانات قصيرة جدًا؛ لو
+  // حابب حماية أقوى ارفعها لحد قريب من مدة الإعلان الفعلية (15-30 ثانية).
+  adMinWatchMs: 5000,
   // إعدادات كل شركة إعلانات على حدة: المكافأة والحد اليومي المسموح لكل
   // شركة بشكل مستقل. تُقرأ من Firebase تحت config/adCompanies/<company>/
   // ولو الشركة غير موجودة، يتم استخدام adReward و adCompanyDailyLimit
@@ -79,15 +88,14 @@ const DEFAULT_CONFIG = {
   // Firebase تحت config/turnstileSiteKey و config/turnstileSecretKey.
   turnstileSiteKey: '0x4AAAAAACOf6mYyukJx5XVy',
   turnstileSecretKey: '0x4AAAAAACOf6iTNX4O5_WP9Kt07Kimr8FU',
-  // ⚠️ دومين صفحة الـ Mini App بالظبط (زي ما هيظهر في data.hostname من رد
-  // Cloudflare siteverify — من غير https:// ومن غير مسار). أي توكن
-  // Turnstile صادر من دومين مختلف عن ده هيترفض حتى لو data.success=true.
-  // القيمة دي قابلة للتعديل من Firebase تحت config/turnstileAllowedHostnames.
-  turnstileAllowedHostnames: ['pmtgram.vercel.app'],
-  // كل كام إعلان (متتالي) يظهر بعده الكابتشا قبل صرف المكافأة — تم
-  // إلغاء الاعتماد عليها: الكابتشا بقت إجبارية في *كل* claim (انظر
-  // handleClaimAdReward)، وبقيت هنا فقط للتوافق لو حد بيقرأها من مكان تاني.
-  turnstileAdsInterval: 1,
+  // كل كام إعلان (متتالي) يظهر بعده الكابتشا قبل صرف المكافأة
+  turnstileAdsInterval: 3,
+  // دومين الواجهة الأمامية المتوقع (بدون https://، بدون مسار) — لو
+  // اتحدد، السيرفر يرفض أي توكن Turnstile راجع منه hostname مختلف عن
+  // القيمة دي (يمنع استخدام توكن اتحل على دومين تاني مع سيرفرنا).
+  // سيبها فاضية لو مش عايز التحقق ده يتفعّل. قابلة للتعديل من Firebase
+  // تحت config/turnstileExpectedHostname.
+  turnstileExpectedHostname: '',
   depositWallet: 'UQAACNWWtTtN7ILkhRERwYUTzo06Bd1Tv_8Yk5gPioIMFoUD',
   withdrawalEnabled: true,     // تشغيل/إيقاف نظام السحب بالكامل
   mandatorySubEnabled: true,   // تشغيل/إيقاف الاشتراك الإجباري بالكامل
@@ -170,99 +178,76 @@ const RATE_LIMIT_MAX_REQ = 20;          // أقصى عدد طلبات في ال�
 const rateLimitStore = new Map();      // key -> [timestamps]
 const usedInitDataHashes = new Map();  // hash -> expireAt (replay protection)
 
-// ──────────────────────────────────────────────────────────────────────
-//  Rate limiting إضافي مخصّص لإندبوينتات المكافآت (بحسب telegramId مش IP)
-//  الهدف: بوت بايثون بيغيّر IP (بروكسي/VPN) برضه هيتحظر لو بيضرب على نفس
-//  الحساب بمعدل عالي، لأن المفتاح هنا هو telegramId + اسم الإندبوينت.
-// ──────────────────────────────────────────────────────────────────────
-const rewardRateLimitStore = new Map(); // `${telegramId}:${endpoint}` -> [timestamps]
-function checkRewardRateLimit(telegramId, endpoint, windowMs, maxReq) {
-  const key = `${telegramId}:${endpoint}`;
-  const now = Date.now();
-  const arr = (rewardRateLimitStore.get(key) || []).filter((t) => now - t < windowMs);
-  if (arr.length >= maxReq) {
-    rewardRateLimitStore.set(key, arr);
-    return false;
-  }
-  arr.push(now);
-  rewardRateLimitStore.set(key, arr);
-  return true;
-}
-
-// ──────────────────────────────────────────────────────────────────────
-//  Ad-View Nonce Store — /startAdView بيولّد nonce عشوائي قصير العمر
-//  ومربوط بـ telegramId + company + fingerprint + deviceId، و/claimAdReward
-//  مش بيقبل أي طلب من غيره. الـ nonce بيتحذف فورًا أول ما يُستخدم
-//  (single-use) وكمان بيتحذف تلقائيًا بعد انتهاء صلاحيته (TTL).
+// ────────────────────────────────────────────────────────────────────
+//  تذاكر مشاهدة الإعلان (Ad View Tickets) — حماية /claimAdReward من أي
+//  سكريبت/بوت بايثون بينادي الإندبوينت مباشرة من غير ما يمر فعليًا
+//  بمسار مشاهدة الإعلان في الواجهة.
 //
-//  ملحوظة مهمة عن حد أدنى للوقت (AD_NONCE_MIN_WATCH_MS):
-//  لو السيرفر رجّع الـ nonce فورًا في رد /startAdView، بوت بايثون ممكن
-//  ياخد نفس الـ nonce ده ويبعت /claimAdReward على طول من غير ما ينتظر
-//  عرض الإعلان خالص. عشان كده لازم نرفض أي /claimAdReward بيوصل قبل ما
-//  يعدي حد أدنى من الوقت من لحظة إصدار الـ nonce (تقريبي لمدة عرض
-//  الإعلان الحقيقية). ده مش إثبات قاطع إن المستخدم شاف الإعلان فعلاً —
-//  الإثبات الحقيقي الوحيد هو postback من شركة الإعلانات نفسها للسيرفر
-//  (server-to-server)، فلو أي شركة من الشركات دي بتوفر postback زي كده
-//  استخدمه بدل الاعتماد على الـ nonce وحده. الـ nonce هنا حل بديل (fallback)
-//  لحد ما الـ postback يتفعّل.
-// ──────────────────────────────────────────────────────────────────────
-const adNonceStore = new Map(); // nonce -> { telegramId, company, fingerprint, deviceId, issuedAt, expiresAt }
-const AD_NONCE_TTL_MS = 2 * 60 * 1000;        // صلاحية الـ nonce: دقيقتين
-const AD_NONCE_MIN_WATCH_MS = 15 * 1000;      // أقل وقت مسموح بين startAdView و claimAdReward (15 ثانية)
+//  الفكرة: /startAdView يولّد توكن عشوائي غير قابل للتخمين (nonce) ويحفظه
+//  في الذاكرة (مربوط بـ telegramId + company + fingerprint + وقت انتهاء
+//  الصلاحية)، ويرجعه للواجهة كـ "adTicket". الواجهة تعرض الإعلان، وبعد
+//  اكتمال المشاهدة فعليًا تنادي /claimAdReward وترفق نفس الـ adTicket.
+//  السيرفر هو الوحيد اللي يقدر يتحقق من صحة التذكرة (مش الواجهة)، والتذكرة
+//  تتحذف نهائيًا أول ما تُستخدم بنجاح (single-use)، فمينفعش تتكرر.
+//
+//  ملحوظة مهمة: التوكن هنا عبارة عن نص عشوائي (Random Nonce) بيتم تخزين
+//  بياناته بالكامل في الذاكرة على السيرفر — مفيش أي "تشفير" الواجهة
+//  محتاجة تفكه. ده أقوى بكتير من فكرة تشفير/تعمية بيانات على الواجهة
+//  والسيرفر يفكها، لأن أي كود شغال جوه الواجهة (JS) ممكن أي حد يفتحه
+//  ويقرأه ويعمل reverse-engineer له، فأي خوارزمية "تخليط" أو تشفير موجودة
+//  في كود الواجهة نفسها تبقى معروفة لأي حد يحلل الكود (بما فيهم سكريبت
+//  بايثون)، ومبقتش سر فعليًا. أما هنا فالسيرفر وحده اللي عارف قيمة
+//  الـ adTicket وممين ينتمي، والواجهة مجرد "بتنقل" التوكن زي ما استلمته
+//  من غير ما تحتاج تفهم أو تفك أي حاجة فيه.
+// ────────────────────────────────────────────────────────────────────
+const AD_NONCE_TTL_MS = 2 * 60 * 1000; // صلاحية التذكرة: دقيقتين
+const adNonceStore = new Map();        // adTicket -> { telegramId, company, fingerprint, issuedAt, expireAt, claiming, pulses }
 
 function cleanupExpiredAdNonces() {
   const now = Date.now();
-  for (const [nonce, rec] of adNonceStore) {
-    if (rec.expiresAt < now) adNonceStore.delete(nonce);
+  for (const [ticket, rec] of adNonceStore) {
+    if (rec.expireAt < now) adNonceStore.delete(ticket);
   }
 }
 
-// بيولّد nonce عشوائي (32 بايت -> hex) مستحيل تخمينه، ويربطه بهوية الطلب.
-function issueAdNonce({ telegramId, company, fingerprint, deviceId }) {
-  cleanupExpiredAdNonces();
-  const nonce = bufferToHex(globalThis.crypto.getRandomValues(new Uint8Array(32)).buffer);
-  const issuedAt = Date.now();
-  adNonceStore.set(nonce, {
-    telegramId: String(telegramId),
-    company: String(company || ''),
-    fingerprint: fingerprint || null,
-    deviceId: deviceId || null,
-    issuedAt,
-    expiresAt: issuedAt + AD_NONCE_TTL_MS,
-  });
-  return { nonce, issuedAt, expiresAt: issuedAt + AD_NONCE_TTL_MS };
+function generateAdTicket() {
+  const bytes = crypto.getRandomValues(new Uint8Array(24)); // 192-bit، مستحيل عمليًا تخمينه
+  return bufferToHex(bytes.buffer);
 }
 
-// بيتحقق من الـ nonce وبيحذفه فورًا (single-use) بصرف النظر عن نتيجة
-// التحقق — عشان محدش يقدر "يجرب تاني" بنفس الـ nonce حتى لو غلط.
-function consumeAdNonce(nonce, { telegramId, company, fingerprint, deviceId }) {
-  if (!nonce || typeof nonce !== 'string') {
-    return { ok: false, error: 'Missing ad session, please reopen the ad' };
-  }
-  const rec = adNonceStore.get(nonce);
-  adNonceStore.delete(nonce); // single-use دايمًا، ناجح أو فاشل
-  if (!rec) {
-    return { ok: false, error: 'Invalid or expired ad session, please watch the ad again' };
-  }
-  const now = Date.now();
-  if (rec.expiresAt < now) {
-    return { ok: false, error: 'Ad session expired, please watch the ad again' };
-  }
-  if (rec.telegramId !== String(telegramId) || rec.company !== String(company || '')) {
-    return { ok: false, error: 'Ad session does not match this request' };
-  }
-  // ربط الـ nonce ببصمة الجهاز ومعرفه — لو الطلبين مش من نفس السياق
-  // (مثلاً نفس الحساب لكن جهاز/متصفح مختلف بعت الـ claim) نرفضه.
-  if (rec.fingerprint && fingerprint && rec.fingerprint !== fingerprint) {
-    return { ok: false, error: 'Device mismatch for this ad session' };
-  }
-  if (rec.deviceId && deviceId && rec.deviceId !== deviceId) {
-    return { ok: false, error: 'Device mismatch for this ad session' };
-  }
-  if (now - rec.issuedAt < AD_NONCE_MIN_WATCH_MS) {
-    return { ok: false, error: 'Ad was not watched long enough' };
-  }
-  return { ok: true };
+// ────────────────────────────────────────────────────────────────────
+//  "نبضات" أثناء مشاهدة الإعلان (session pulses) — طبقة حماية إضافية
+//  فوق adTicket. الفكرة: طول ما الإعلان بيتعرض فعليًا، الواجهة بتنادي
+//  /sessionSync كل ~2 ثانية (5 مرات إجمالًا). كل نداء لازم يرجع فيه
+//  آخر كود استلمته من النداء اللي قبله (أو فاضي في أول مرة)، والسيرفر
+//  يرجّع كود جديد عشوائي. النتيجة: سلسلة من 5 أكواد يصدرها السيرفر
+//  (n1..n5) + 5 قيم يردّها الكلاينت (echo لكل كود سابق) = 10 قيمة
+//  بتتبادل فعليًا بين الطرفين طول مدة المشاهدة. عند /claimAdReward
+//  لازم يترفق نفس الـ 5 أكواد اللي استلمها بالترتيب — أي قيمة غلط أو
+//  متكررة معناها التسلسل اتلعب فيه (سكريبت بيولّد/يعيد قيم من عنده
+//  بدل ما يتبع النداءات الحقيقية) فالحساب يتحظر فورًا. أي نقص في عدد
+//  النبضات (مثلاً الشبكة اتقطعت) بيخلي claimAdReward يفشل برضه لكن من
+//  غير حظر — ممكن يعيد المحاولة.
+// ────────────────────────────────────────────────────────────────────
+const AD_PULSE_COUNT = 5;          // عدد النبضات المطلوبة لكل مشاهدة إعلان
+const AD_PULSE_MIN_GAP_MS = 1200;  // أقل فاصل مسموح بين نبضتين (يمنع النداء الفوري المتكرر)
+const AD_PULSE_MAX_GAP_MS = 6000;  // أكتر فاصل مسموح قبل ما نعتبر السلسلة "باظت"
+
+function generatePulseCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(12));
+  return bufferToHex(bytes.buffer);
+}
+
+// حظر فوري لحساب ثبت تلاعبه بسلسلة النبضات — نفس شكل الحظر المستخدم في
+// نظام مكافحة الاحتيال العام (blocked_accounts/{telegramId}).
+async function blockAccountForPulseFraud(env, telegramId, reasonCode) {
+  const reason = 'Suspicious activity detected while verifying ad view. This account has been banned from using the bot.';
+  try {
+    await dbUpdate(env, `blocked_accounts/${telegramId}`, {
+      reason, reasonCode: reasonCode || 'ad_pulse_fraud', ts: Date.now(),
+    });
+  } catch (_) {}
+  return failBlocked(reason, reasonCode || 'ad_pulse_fraud', []);
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -610,14 +595,15 @@ function failBlocked(reason, reasonCode, linkedAccounts) {
 //  التحقق من Cloudflare Turnstile (Captcha)
 //  يُستدعى قبل صرف مكافأة إعلان (كل N إعلان) أو قبل صرف مكافأة أي لعبة.
 // ──────────────────────────────────────────────────────────────────────
-// options.expectedAction: لازم يتطابق مع الـ "action" اللي اتبعت للـ
-// widget في الواجهة (data-action="claim_ad_reward" مثلًا) — من غير التحقق
-// ده، أي توكن Turnstile صالح لأي فعل ممكن يتقبل لأي فعل تاني (Action Reuse).
-// options.allowedHostnames: قايمة الدومينات المسموح بيها لصفحة الـ Mini App
-// — لو الرد من Cloudflare بيرجّع hostname مختلف، معناه التوكن اتولّد من
-// صفحة تانية (مش دومينك) فلازم يترفض حتى لو data.success = true.
+// options.expectedHostname: لو موجودة، لازم تساوي data.hostname الراجعة من
+// Cloudflare (الدومين اللي اتحل عليه التوكن فعليًا) — بيمنع استخدام توكن
+// اتحل على دومين تاني (مثلاً موقع تجريبي بايثون بيقلد الطلب) مع سيرفرنا.
+// options.expectedAction: لو موجودة، لازم تساوي data.action الراجعة —
+// بيمنع إعادة استخدام توكن اتحل لغرض تاني (زي كابتشا اللعبة) مع مكافأة
+// الإعلان، أو العكس. القيمتين دول قبل كده كان الكود بيتجاهلهم تمامًا
+// ويتحقق فقط من data.success.
 async function verifyTurnstile(token, ip, secretKey, options = {}) {
-  const { expectedAction = null, allowedHostnames = [] } = options;
+  const { expectedHostname, expectedAction } = options;
   if (!secretKey) return { success: false, errorCodes: ['not-configured'] };
   if (!token || typeof token !== 'string') return { success: false, errorCodes: ['missing-input-response'] };
   try {
@@ -631,21 +617,16 @@ async function verifyTurnstile(token, ip, secretKey, options = {}) {
       body: form.toString(),
     });
     const data = await resp.json().catch(() => ({}));
-    if (!data.success) return { success: false, errorCodes: data['error-codes'] || [] };
-
-    // ── تحقق من hostname (لو الإعدادات فيها قايمة دومينات مسموح بيها) ──
-    if (Array.isArray(allowedHostnames) && allowedHostnames.length > 0) {
-      if (!data.hostname || !allowedHostnames.includes(data.hostname)) {
-        return { success: false, errorCodes: ['hostname-mismatch'], hostname: data.hostname };
-      }
+    if (!data.success) {
+      return { success: false, errorCodes: data['error-codes'] || [] };
     }
-
-    // ── تحقق من action (لو متوقّع فعل معيّن) ──
+    if (expectedHostname && data.hostname !== expectedHostname) {
+      return { success: false, errorCodes: ['hostname-mismatch'], hostname: data.hostname };
+    }
     if (expectedAction && data.action !== expectedAction) {
       return { success: false, errorCodes: ['action-mismatch'], action: data.action };
     }
-
-    return { success: true, errorCodes: [], hostname: data.hostname, action: data.action };
+    return { success: true, errorCodes: [] };
   } catch (err) {
     return { success: false, errorCodes: ['internal-error'], error: err.message };
   }
@@ -1831,35 +1812,13 @@ async function handleHeartbeat(env, ctx) {
 }
 
 async function handleClaimDailyBonus(env, ctx) {
-  const { user, config, body } = ctx;
+  const { user, config } = ctx;
   const telegramId = user.telegramId;
-
-  // Rate limit مخصوص للحساب — الحد اليومي الفعلي بيمنع أي حد يكرر المكافأة
-  // في نفس اليوم أصلاً، لكن ده بيمنع محاولات "تجربة" متكررة سريعة برضه.
-  if (!checkRewardRateLimit(telegramId, 'claimDailyBonus', 60 * 1000, 5)) {
-    return fail('Too many requests, please slow down', 429);
-  }
-
   const dateKey = todayKeyCairo();
   const freshUser = await dbGet(env, `users/${telegramId}`);
   if (freshUser?.dailyBonusDate === dateKey) {
     return fail("Daily bonus already claimed");
   }
-
-  // ── كابتشا Cloudflare Turnstile إجبارية — بتمنع بوت بايثون من مجرد
-  // إعادة تشغيل initData/نداء الإندبوينت تلقائيًا كل يوم من غير متصفح حقيقي. ──
-  const secretKey = config.turnstileSecretKey || env.TURNSTILE_SECRET_KEY || DEFAULT_CONFIG.turnstileSecretKey;
-  const allowedHostnames = Array.isArray(config.turnstileAllowedHostnames) && config.turnstileAllowedHostnames.length
-    ? config.turnstileAllowedHostnames
-    : DEFAULT_CONFIG.turnstileAllowedHostnames;
-  const verify = await verifyTurnstile(body.turnstileToken, ctx.ip, secretKey, {
-    expectedAction: 'daily_bonus',
-    allowedHostnames,
-  });
-  if (!verify.success) {
-    return failCaptcha('You must pass the security check (Captcha) to claim the daily bonus');
-  }
-
   const reward = Number(config.dailyBonusReward ?? DEFAULT_CONFIG.dailyBonusReward);
   const newBalance = await incrementBalance(env, telegramId, reward);
   await dbUpdate(env, `users/${telegramId}`, { dailyBonusDate: dateKey });
@@ -1890,27 +1849,23 @@ async function handleRedeemCode(env, ctx) {
   return ok({ shibaBalance: newBalance, shibaAdded: reward });
 }
 
-// ───────────────────────── POST /startAdView ─────────────────────────
-// بيتنادى قبل ما الواجهة تعرض إعلان الشركة المطلوبة. بيرجّع nonce عشوائي
-// قصير العمر (2 دقيقة) مربوط بالحساب + الشركة + بصمة الجهاز، وحيد
-// الاستخدام. /claimAdReward بيرفض أي طلب من غير nonce صالح صادر من هنا.
+// ───────────────────────── POST /startAdView ───────────────────────────
+// يُستدعى من الواجهة *قبل* عرض إعلان أي شركة (Adsgram/GigaPub/Monetix)،
+// ويرجّع "adTicket" (توكن عشوائي وحيد الاستخدام، صالح لمدة AD_NONCE_TTL_MS
+// فقط) مربوط بـ telegramId + company + بصمة الجهاز الحالية. /claimAdReward
+// بعد كده يرفض أي طلب مايبقاش معاه adTicket صالح ومطابق — فمينفعش أي
+// سكريبت/بوت بايثون ينادي claimAdReward مباشرة من غير ما يمر على الإندبوينت
+// ده الأول (ومينفعش يعيد استخدام نفس التذكرة مرتين).
 async function handleStartAdView(env, ctx) {
   const { user, config, body } = ctx;
-
-  // Rate limit مخصوص لإصدار الـ nonce نفسه — بدون ده بوت ممكن يفتح آلاف
-  // الـ nonces فارغة (من غير ما يستخدمها) عشان يحاول يخمن التوقيت المطلوب.
-  if (!checkRewardRateLimit(user.telegramId, 'startAdView', 60 * 1000, 20)) {
-    return fail('Too many requests, please slow down', 429);
-  }
-
   const company = canonicalAdCompany(body.company);
-  if (!company) return fail('Invalid ad company');
+  const companyConfig = getAdCompanyConfig(config, company);
 
-  // نتأكد من الحدود اليومية *قبل* إصدار الـ nonce (منطق مبدئي فقط —
-  // التحقق النهائي الحاسم بيتعمل تاني وقت /claimAdReward على أحدث بيانات).
+  // فحص مبدئي للحدود اليومية (نفس فحص claimAdReward) — مجرد رفض مبكر
+  // عشان مانديش تذكرة لطلب مستحيل يتصرف أصلًا؛ claimAdReward بيعيد
+  // نفس الفحص ببيانات محدثة قبل أي صرف فعلي.
   const today = todayKeyCairo();
   const freshUser = await dbGet(env, `users/${user.telegramId}`);
-  const companyConfig = getAdCompanyConfig(config, company);
   const byCompany = freshUser?.adWatchDate === today
     ? normalizeAdWatchCounters(freshUser.adsWatchedByCompany, freshUser.adsWatchedToday)
     : {};
@@ -1918,100 +1873,237 @@ async function handleStartAdView(env, ctx) {
   if (companyConfig.dailyLimit > 0 && watched >= companyConfig.dailyLimit) {
     return fail('Daily ad limit reached for this company');
   }
-  const overallDailyLimit = Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit);
-  if (overallDailyLimit > 0 && totalAdWatchCounters(byCompany) >= overallDailyLimit) {
-    return fail('Daily ad limit reached');
-  }
-
-  const fingerprint = afSanitiseKey(body._deviceFingerprint, 64);
-  const deviceId = afSanitiseKey(body._deviceId, 64);
-  const { nonce, expiresAt } = issueAdNonce({
-    telegramId: user.telegramId,
-    company,
-    fingerprint,
-    deviceId,
-  });
-  return ok({ adNonce: nonce, expiresAt, minWatchMs: AD_NONCE_MIN_WATCH_MS });
-}
-
-async function handleClaimAdReward(env, ctx) {
-  const { user, config, body } = ctx;
-
-  // ── Rate limit إضافي مخصوص للحساب (مش بس IP) ────────────────────────
-  // بيمنع بوت بايثون من ضرب /claimAdReward بمعدل عالي على نفس الحساب حتى
-  // لو بيغيّر IP كل مرة.
-  if (!checkRewardRateLimit(user.telegramId, 'claimAdReward', 60 * 1000, 12)) {
-    return fail('Too many ad-reward requests, please slow down', 429);
-  }
-
-  const today = todayKeyCairo();
-  const freshUser = await dbGet(env, `users/${user.telegramId}`);
-  const company = canonicalAdCompany(body.company);
-  const companyConfig = getAdCompanyConfig(config, company);
-  const limit = companyConfig.dailyLimit;
-  const byCompany = freshUser?.adWatchDate === today
-    ? normalizeAdWatchCounters(freshUser.adsWatchedByCompany, freshUser.adsWatchedToday)
-    : {};
-  const watched = Number(byCompany[company] || 0);
-  if (limit > 0 && watched >= limit) return fail('Daily ad limit reached for this company');
   const totalWatchedToday = totalAdWatchCounters(byCompany);
   const overallDailyLimit = Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit);
   if (overallDailyLimit > 0 && totalWatchedToday >= overallDailyLimit) {
     return fail('Daily ad limit reached');
   }
 
-  // ── لازم /startAdView الأول: nonce عشوائي قصير العمر مربوط بالحساب/
-  // الشركة/الجهاز، وحيد الاستخدام، وبيتأكد من مرور وقت كافٍ منذ إصداره
-  // (انظر شرح adNonceStore فوق). أي طلب من غير nonce صالح يترفض فورًا. ──
-  const fingerprint = afSanitiseKey(body._deviceFingerprint, 64);
-  const deviceId = afSanitiseKey(body._deviceId, 64);
-  const nonceCheck = consumeAdNonce(body.adNonce, {
-    telegramId: user.telegramId,
+  cleanupExpiredAdNonces();
+  const fp = afSanitiseKey(body._deviceFingerprint, 64) || 'missing';
+  const ticket = generateAdTicket();
+  const issuedAt = Date.now();
+  adNonceStore.set(ticket, {
+    telegramId: String(user.telegramId),
     company,
-    fingerprint,
-    deviceId,
+    fingerprint: fp,
+    issuedAt,
+    expireAt: issuedAt + AD_NONCE_TTL_MS,
+    claiming: false,
+    pulses: [],          // [{code, issuedAt}] — سلسلة النبضات أثناء المشاهدة (انظر تعليق AD_PULSE_COUNT فوق)
   });
-  if (!nonceCheck.ok) return fail(nonceCheck.error, 400);
 
-  // ── كابتشا Cloudflare Turnstile إجبارية في *كل* claim (مش كل N) ─────
-  // التكلفة على المستخدم الحقيقي قليلة (تحقق شبه شفاف غالبًا)، والفايدة
-  // في منع الأتمتة (Python/curl) أكبر بكتير من توفير الاحتكاك.
-  const secretKey = config.turnstileSecretKey || env.TURNSTILE_SECRET_KEY || DEFAULT_CONFIG.turnstileSecretKey;
-  const allowedHostnames = Array.isArray(config.turnstileAllowedHostnames) && config.turnstileAllowedHostnames.length
-    ? config.turnstileAllowedHostnames
-    : DEFAULT_CONFIG.turnstileAllowedHostnames;
-  const verify = await verifyTurnstile(body.turnstileToken, ctx.ip, secretKey, {
-    expectedAction: 'claim_ad_reward',
-    allowedHostnames,
-  });
-  if (!verify.success) {
-    return failCaptcha('You must pass the security check (Captcha) to continue and receive the ad reward');
+  return ok({ adTicket: ticket, expiresInMs: AD_NONCE_TTL_MS, company });
+}
+
+// ─────────────────────── POST /sessionSync ───────────────────────────
+// اسم الإندبوينت واسماء الحقول هنا مقصود تكون عامة/مبهمة (sid/p/n) عشان
+// أي حد بيحلل الـ Network tab ميلاقيش اسم واضح زي "adPulse/adHeartbeat"
+// يدله على إن ده بروتوكول تحقق من مشاهدة إعلان حقيقية. المنطق الفعلي:
+// نداء متكرر كل ~2 ثانية طول مدة عرض الإعلان، كل نداء لازم يرجّع فيه
+// آخر كود اتبعت في النداء اللي فات (p) عشان ياخد الكود الجديد (n).
+async function handleSessionSync(env, ctx) {
+  const { user, body } = ctx;
+  cleanupExpiredAdNonces();
+
+  const sid = String(body.sid || '');
+  const record = sid ? adNonceStore.get(sid) : null;
+  const fp = afSanitiseKey(body._deviceFingerprint, 64) || 'missing';
+
+  if (!record) {
+    return fail('Session expired or invalid', 400);
+  }
+  if (record.telegramId !== String(user.telegramId) || record.fingerprint !== fp) {
+    return fail('Session does not match this request', 400);
   }
 
-  const reward = Math.floor(companyConfig.reward);
-  if (!Number.isFinite(reward) || reward <= 0) return fail('Invalid ad reward');
-  const newBalance = await incrementBalance(env, user.telegramId, reward);
-  byCompany[company] = watched + 1;
-  await dbUpdate(env, `users/${user.telegramId}`, {
-    adWatchDate: today,
-    adsWatchedByCompany: byCompany,
-    adsWatchedToday: totalAdWatchCounters(byCompany),
-    totalAdsWatched: Number(freshUser?.totalAdsWatched || 0) + 1,
-  });
-  await addBalanceLog(env, user.telegramId, { type: 'ad_reward', amount: reward, date: today, ts: Date.now() });
-  if (watched + 1 >= 10) {
-    await activateReferralIfNeeded(env, user.telegramId, config);
+  const prev = typeof body.p === 'string' ? body.p : '';
+  const pulses = record.pulses || (record.pulses = []);
+
+  if (pulses.length >= AD_PULSE_COUNT) {
+    return fail('Session already complete', 400);
   }
-  return ok({
-    shibaBalance: newBalance,
-    shibaAdded: reward,
-    company,
-    adsWatchedToday: totalAdWatchCounters(byCompany),
-    adsWatchedByCompany: byCompany,
-    adCompanies: getAllAdCompaniesConfig(config),
-    adCompanyDailyLimit: limit,
-    adDailyTotalLimit: Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit),
-  });
+
+  const lastCode = pulses.length ? pulses[pulses.length - 1].code : '';
+  const lastAt = pulses.length ? pulses[pulses.length - 1].issuedAt : record.issuedAt;
+
+  // أول نداء: مفيش p سابق. أي نداء بعد كده لازم يرجّع بالظبط آخر كود
+  // اتصدر — أي قيمة تانية (سواء فاضية أو غلط أو كود قديم اتكرر) دليل
+  // واضح إن في سكريبت بيحاول يخمن/يعيد التسلسل من غير ما يتبع النداءات
+  // الحقيقية بترتيبها، فالحساب يتحظر فورًا.
+  if (pulses.length === 0) {
+    if (prev) {
+      return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_unexpected');
+    }
+  } else if (prev !== lastCode) {
+    return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_mismatch');
+  }
+
+  const now = Date.now();
+  const gap = now - lastAt;
+  if (gap < AD_PULSE_MIN_GAP_MS) {
+    // أسرع من المعقول لواجهة حقيقية بتستنى ~2 ثانية — رفض عادي (مش حظر)
+    // لأن ممكن يكون تكرار طلب شبكي عادي (retry).
+    return fail('Too fast', 429);
+  }
+  if (gap > AD_PULSE_MAX_GAP_MS) {
+    // اتأخر كتير — السلسلة تعتبر باظت، الكلاينت المفروض يبدأ تذكرة جديدة.
+    return fail('Session timed out', 400);
+  }
+
+  const code = generatePulseCode();
+  pulses.push({ code, issuedAt: now });
+  return ok({ n: code, left: AD_PULSE_COUNT - pulses.length });
+}
+
+async function handleClaimAdReward(env, ctx) {
+  const { user, config, body } = ctx;
+  const company = canonicalAdCompany(body.company);
+
+  // ── التحقق من تذكرة مشاهدة الإعلان (adTicket) ────────────────────────
+  // لازم تكون اتولّدت من /startAdView قبل كده لنفس telegramId/الشركة/بصمة
+  // الجهاز، ولسه صالحة (متعدتش AD_NONCE_TTL_MS)، ومتستخدمتش قبل كده.
+  cleanupExpiredAdNonces();
+  const ticket = String(body.adTicket || '');
+  const record = ticket ? adNonceStore.get(ticket) : null;
+  const fp = afSanitiseKey(body._deviceFingerprint, 64) || 'missing';
+
+  if (!record) {
+    return fail('Ad view ticket is missing or expired — please watch the ad again', 400);
+  }
+  if (record.claiming) {
+    // نفس التذكرة مستخدمة حاليًا في طلب تاني شغال (منع إعادة الاستخدام
+    // المتزامن/Race Condition) — مش خطأ عادي، ده مؤشر تلاعب واضح.
+    return fail('This ad view ticket is already being processed', 400);
+  }
+  if (record.expireAt < Date.now()) {
+    adNonceStore.delete(ticket);
+    return fail('Ad view ticket expired — please watch the ad again', 400);
+  }
+  if (record.telegramId !== String(user.telegramId) || record.company !== company || record.fingerprint !== fp) {
+    // التذكرة موجودة لكن مش لنفس المستخدم/الشركة/الجهاز اللي اتولّدت له
+    return fail('Ad view ticket does not match this request', 400);
+  }
+
+  // ── الحد الأدنى للوقت بين بداية الإعلان والمطالبة بالمكافأة ──────────
+  // لو الطلب وصل أسرع من adMinWatchMs من وقت /startAdView، ده مستحيل
+  // يبقى فيه إعلان حقيقي اتشاف في المدة دي — الغالب سكريبت بينادي
+  // الإندبوينتين ورا بعض على طول. بنرفض من غير ما نحذف التذكرة، فلو كان
+  // فعلًا مستخدم حقيقي (شبكة سريعة قوي أو تزامن غريب) يقدر يعيد المحاولة
+  // بنفس التذكرة تاني بعد ما الوقت يعدي وقبل ما تنتهي صلاحيتها.
+  const minWatchMs = Math.max(0, Number(config.adMinWatchMs ?? DEFAULT_CONFIG.adMinWatchMs ?? 5000));
+  if (minWatchMs > 0 && Date.now() - record.issuedAt < minWatchMs) {
+    return fail('Ad view is too fast to be valid — please watch the full ad', 400);
+  }
+
+  // ── التحقق من سلسلة النبضات (chk) اللي اتجمعت أثناء المشاهدة ─────────
+  // الكلاينت لازم يرفق نفس الـ AD_PULSE_COUNT كود اللي استلمهم من
+  // /sessionSync بالظبط وبنفس الترتيب، بالإضافة للتيكيت الأساسي وطابع
+  // زمني (ct). عدم اكتمال العدد = فشل عادي (ممكن يعيد المحاولة). أي قيمة
+  // غلط أو مكررة = دليل تلاعب واضح (الكلاينت بيبعت بيانات مش هي اللي
+  // السيرفر أصدرها فعليًا) → حظر فوري.
+  const pulses = record.pulses || [];
+  const chk = Array.isArray(body.chk) ? body.chk.map((v) => String(v || '')) : [];
+  const clientTs = Number(body.ct);
+
+  if (pulses.length < AD_PULSE_COUNT) {
+    return fail('Ad view could not be verified — please watch the ad again', 400);
+  }
+  if (!Number.isFinite(clientTs)) {
+    return fail('Invalid request', 400);
+  }
+  if (chk.length !== AD_PULSE_COUNT) {
+    return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_claim_length');
+  }
+  const uniqueChk = new Set(chk);
+  if (uniqueChk.size !== chk.length) {
+    // قيم مكررة داخل نفس الطلب — مش ممكن يحصل مع نداءات حقيقية متتالية
+    return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_claim_duplicate');
+  }
+  for (let i = 0; i < AD_PULSE_COUNT; i++) {
+    if (chk[i] !== pulses[i].code) {
+      return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_claim_mismatch');
+    }
+  }
+
+  // قفل التذكرة فورًا (Sync، قبل أي await) عشان لو نفس التذكرة اتبعتت في
+  // طلبين متوازيين، الطلب التاني يترفض فورًا بدل ما ياخد المكافأة مرتين.
+  record.claiming = true;
+
+  try {
+    const today = todayKeyCairo();
+    const freshUser = await dbGet(env, `users/${user.telegramId}`);
+    const companyConfig = getAdCompanyConfig(config, company);
+    const limit = companyConfig.dailyLimit;
+    const byCompany = freshUser?.adWatchDate === today
+      ? normalizeAdWatchCounters(freshUser.adsWatchedByCompany, freshUser.adsWatchedToday)
+      : {};
+    const watched = Number(byCompany[company] || 0);
+    if (limit > 0 && watched >= limit) {
+      adNonceStore.delete(ticket);
+      return fail('Daily ad limit reached for this company');
+    }
+    const totalWatchedToday = totalAdWatchCounters(byCompany);
+    const overallDailyLimit = Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit);
+    if (overallDailyLimit > 0 && totalWatchedToday >= overallDailyLimit) {
+      adNonceStore.delete(ticket);
+      return fail('Daily ad limit reached');
+    }
+
+    // ── كابتشا Cloudflare Turnstile كل N إعلان (افتراضيًا كل 3) ──────────
+    // totalWatchedToday هو عدد الإعلانات المُحتسبة *قبل* هذا الإعلان، فلو
+    // كان هذا الإعلان سيجعل الإجمالي مضاعفًا لـ interval، نطلب كابتشا صالحة
+    // قبل صرف المكافأة. الواجهة الأمامية تُعيد نفس الطلب (بنفس adTicket)
+    // مع turnstileToken بعد أن يحل المستخدم الكابتشا — فبنفك القفل هنا
+    // (record.claiming = false) من غير ما نحذف التذكرة، عشان تفضل صالحة
+    // للمحاولة اللي جاية بعد الكابتشا مباشرة.
+    const turnstileInterval = Math.max(1, Math.floor(Number(config.turnstileAdsInterval ?? DEFAULT_CONFIG.turnstileAdsInterval ?? 3)));
+    if ((totalWatchedToday + 1) % turnstileInterval === 0) {
+      const secretKey = config.turnstileSecretKey || env.TURNSTILE_SECRET_KEY || DEFAULT_CONFIG.turnstileSecretKey;
+      const verify = await verifyTurnstile(body.turnstileToken, ctx.ip, secretKey, {
+        expectedHostname: config.turnstileExpectedHostname || undefined,
+        expectedAction: 'ad_reward',
+      });
+      if (!verify.success) {
+        record.claiming = false;
+        return failCaptcha('You must pass the security check (Captcha) to continue and receive the ad reward');
+      }
+    }
+
+    // التذكرة اتستخدمت فعليًا دلوقتي — تتحذف نهائيًا (single-use) قبل أي
+    // صرف للمكافأة، فمينفعش حد يعيد استخدامها تاني مهما كانت النتيجة بعد كده.
+    adNonceStore.delete(ticket);
+
+    const reward = Math.floor(companyConfig.reward);
+    if (!Number.isFinite(reward) || reward <= 0) return fail('Invalid ad reward');
+    const newBalance = await incrementBalance(env, user.telegramId, reward);
+    byCompany[company] = watched + 1;
+    await dbUpdate(env, `users/${user.telegramId}`, {
+      adWatchDate: today,
+      adsWatchedByCompany: byCompany,
+      adsWatchedToday: totalAdWatchCounters(byCompany),
+      totalAdsWatched: Number(freshUser?.totalAdsWatched || 0) + 1,
+    });
+    await addBalanceLog(env, user.telegramId, { type: 'ad_reward', amount: reward, date: today, ts: Date.now() });
+    if (watched + 1 >= 10) {
+      await activateReferralIfNeeded(env, user.telegramId, config);
+    }
+    return ok({
+      shibaBalance: newBalance,
+      shibaAdded: reward,
+      company,
+      adsWatchedToday: totalAdWatchCounters(byCompany),
+      adsWatchedByCompany: byCompany,
+      adCompanies: getAllAdCompaniesConfig(config),
+      adCompanyDailyLimit: limit,
+      adDailyTotalLimit: Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit),
+    });
+  } catch (err) {
+    // أي خطأ غير متوقع: نفك القفل بدل ما تفضل التذكرة "معلّقة" للأبد
+    // (لو لسه موجودة أصلًا — ممكن تكون اتحذفت فوق لو الخطأ حصل بعدها).
+    record.claiming = false;
+    throw err;
+  }
 }
 
 // ───────────────────────── Mining session ─────────────────────────
@@ -2069,12 +2161,9 @@ async function handlePlayGame(env, ctx) {
   // نتحقق قبل استهلاك محاولة اللعب حتى لا يخسر المستخدم محاولته لو فشل
   // في اجتياز الكابتشا. الواجهة تُعيد نفس الطلب مع turnstileToken بعد الحل.
   const secretKey = config.turnstileSecretKey || env.TURNSTILE_SECRET_KEY || DEFAULT_CONFIG.turnstileSecretKey;
-  const allowedHostnamesGame = Array.isArray(config.turnstileAllowedHostnames) && config.turnstileAllowedHostnames.length
-    ? config.turnstileAllowedHostnames
-    : DEFAULT_CONFIG.turnstileAllowedHostnames;
   const verify = await verifyTurnstile(body.turnstileToken, ctx.ip, secretKey, {
-    expectedAction: 'play_game',
-    allowedHostnames: allowedHostnamesGame,
+    expectedHostname: config.turnstileExpectedHostname || undefined,
+    expectedAction: 'game_reward',
   });
   if (!verify.success) {
     return failCaptcha('You must pass the security check (Captcha) to continue and receive the game reward');
@@ -2877,6 +2966,7 @@ const ROUTES = {
   '/redeemCode': handleRedeemCode,
   '/startAdView': handleStartAdView,
   '/claimAdReward': handleClaimAdReward,
+  '/sessionSync': handleSessionSync,
   '/startMining': handleStartMining,
   '/claimMining': handleClaimMining,
   '/playGame': handlePlayGame,
