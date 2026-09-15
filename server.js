@@ -279,6 +279,13 @@ const AF_MAX_ACCOUNTS_PER_DEVICE = 1;
 // جهازين مختلفين شبه معدوم — لسه بيتعامل معاه كدليل حظر فوري.
 const AF_FP_COMMON_THRESHOLD = 4;
 
+// ── تحديث: مطابقة الإشارات المتعددة (Multi-Signal Overlap) ──────────
+// طبقة حماية إضافية بتتعامل تحديدًا مع اللي وصفناه فوق: مستخدم بيفتح
+// نفس الميني-آب من تطبيق تيليجرام تاني (تخزين WebView منفصل يصفّر
+// deviceId) أو بيغيّر الـ IP، فيتخطى فحصَي fingerprintReused/deviceIdReused
+// من غير ما يغيّر جهازه الفعلي أبدًا. راجع afCheckSignalOverlap وAF_WEIGHTS
+// فوق (multiSignalDeviceMatch) للتفاصيل.
+
 const AF_WEIGHTS = {
   fingerprintReused:   35,
   deviceIdReused:      30,
@@ -288,7 +295,70 @@ const AF_WEIGHTS = {
   devToolsOpen:        10,
   sameIpManyAccounts:  15,
   fingerprintMissing:   5,
+  multiSignalDeviceMatch: 40,
 };
+
+// ── مطابقة إشارات فردية (Multi-Signal Overlap) ───────────────────────
+// المشكلة اللي الطبقة دي بتحلّها: الـ deviceId (UUID المخزَّن محليًا)
+// بيتصفّر لو المستخدم فتح الميني-آب من تطبيق تيليجرام تاني (تخزين
+// WebView منفصل) أو مسح بيانات التطبيق، وده بيدّي فرصة لتعدد الحسابات
+// من نفس الجهاز الفعلي من غير ما يتكرر أي deviceId. لكن الإشارات
+// الآتية من الجهاز/النظام مباشرة (canvas/webgl/hardware/fonts/audio/
+// media/uaHighEntropy) *لا تعتمد على تخزين التطبيق ولا على الـ IP* —
+// فهي بتفضل ثابتة لنفس الجهاز الفعلي حتى لو اتغيّر التطبيق أو الشبكة.
+// بدل ما نعتمد على "تطابق شامل" لكل الإشارات مجمّعة في هاش واحد (اللي
+// بيطلع شائع بين أجهزة مختلفة بنفس الموديل - انظر AF_FP_COMMON_THRESHOLD
+// فوق)، بنقارن كل إشارة لوحدها، ولو *نفس الحساب التاني بالتحديد* طابق
+// مع الحساب الحالي على عدد كافٍ من الإشارات القوية مع بعض (مش مجرد
+// إشارة واحدة شائعة)، ده دليل قوي جدًا إنه نفس الجهاز الفعلي — أقوى من
+// أي إشارة لوحدها ومستقل تمامًا عن الـ IP وعن تطبيق تيليجرام المستخدَم.
+const AF_STRONG_SIGNALS = ['hardwareHash', 'uaHash', 'fontsHash', 'webglHash'];
+const AF_WEAK_SIGNALS   = ['canvasHash', 'mediaHash', 'audioHash'];
+const AF_SIGNAL_INTERSECTION_MIN = 3; // عدد الإشارات القوية اللي لازم تتفق مع نفس الحساب التاني
+const AF_SIGNAL_MAX_TIDS_STORED  = 50; // حد أقصى للحسابات المخزَّنة تحت كل هاش إشارة (تفادي تضخّم غير محدود)
+
+async function afCheckSignalOverlap(env, signals, tid) {
+  const result = { intersectionOwner: null, matchedStrongCount: 0, anyWeakMatch: false, updates: [] };
+  if (!signals || typeof signals !== 'object') return result;
+
+  const perSignalOwners = {}; // signalName -> Set(tids matched, excluding self)
+  const allNames = AF_STRONG_SIGNALS.concat(AF_WEAK_SIGNALS);
+
+  for (const name of allNames) {
+    const raw = signals[name];
+    const hash = afSanitiseKey(typeof raw === 'string' ? raw : null, 64);
+    if (!hash || raw === 'unavailable') continue;
+    const path = `device_signal_map/${name}/${hash}`;
+    try {
+      const record = await dbGet(env, path);
+      const tids = record && Array.isArray(record.tids) ? record.tids.map(String) : [];
+      const others = tids.filter((t) => t !== tid);
+      if (others.length) perSignalOwners[name] = new Set(others);
+      if (!tids.includes(tid)) {
+        const nextTids = tids.concat(tid).slice(-AF_SIGNAL_MAX_TIDS_STORED);
+        result.updates.push(dbSet(env, path, { tids: nextTids, lastSeen: Date.now() }));
+      }
+    } catch (_) {}
+  }
+
+  // احسب أي حساب "تاني" اتكرر عبر أكبر عدد من الإشارات *القوية*
+  const tally = {};
+  for (const name of AF_STRONG_SIGNALS) {
+    const set = perSignalOwners[name];
+    if (!set) continue;
+    set.forEach((otherTid) => { tally[otherTid] = (tally[otherTid] || 0) + 1; });
+  }
+  let bestTid = null, bestCount = 0;
+  for (const [otherTid, count] of Object.entries(tally)) {
+    if (count > bestCount) { bestTid = otherTid; bestCount = count; }
+  }
+  result.matchedStrongCount = bestCount;
+  if (bestCount >= AF_SIGNAL_INTERSECTION_MIN) result.intersectionOwner = bestTid;
+  result.anyWeakMatch = AF_WEAK_SIGNALS.some((name) => perSignalOwners[name] && perSignalOwners[name].size > 0);
+
+  try { await Promise.all(result.updates); } catch (_) {}
+  return result;
+}
 
 function afSanitiseKey(str, maxLen = 64) {
   if (typeof str !== 'string') return null;
@@ -307,6 +377,7 @@ function afCalcScore(flags) {
 function afBuildReason(flags) {
   const parts = [];
   if (flags.deviceIdReused)     parts.push('Same device ID');
+  if (flags.multiSignalDeviceMatch) parts.push('Multiple independent device signals match another account');
   if (flags.fingerprintReused)  parts.push('Same device fingerprint');
   if (flags.rapidAccountCreate) parts.push('Multiple accounts created quickly');
   if (flags.headlessBrowser)    parts.push('Headless browser');
@@ -338,7 +409,7 @@ async function afGetLinkedAccounts(env, fp, did, excludeTid, maxCount = 10) {
   const users = await Promise.all(ids.map((id) => dbGet(env, `users/${id}`).catch(() => null)));
   return ids.map((id, i) => {
     const u = users[i] || {};
-    return { name: u.firstName || u.username || 'Unknown', username: u.username || '', photoUrl: u.photoUrl || '' };
+    return { telegramId: id, name: u.firstName || u.username || 'Unknown', username: u.username || '', photoUrl: u.photoUrl || '' };
   });
 }
 
@@ -349,9 +420,10 @@ async function checkAntiFraud(env, request, telegramId, body) {
   const rawFP  = body._deviceFingerprint || null;
   const rawDID = body._deviceId          || null;
   const suspFlags = body._suspiciousFlags || {};
-  // NEW: بصمات كل إشارة لوحدها (من نسخة الواجهة المحدَّثة) — بتتخزن مع
-  // سجل الجهاز فقط لأغراض المراجعة/التصحيح لاحقًا، ومش بتُستخدم حاليًا
-  // في قرار الحظر نفسه.
+  // بصمات كل إشارة لوحدها (من نسخة الواجهة المحدَّثة). بتتخزن مع سجل
+  // الجهاز لأغراض المراجعة، وكمان بتُستخدم في مطابقة الإشارات المتعددة
+  // (afCheckSignalOverlap تحت) لاكتشاف نفس الجهاز الفعلي حتى لو اتغيّر
+  // تطبيق تيليجرام أو الـ IP أو اتصفّر deviceId.
   const signals = (body._signals && typeof body._signals === 'object') ? body._signals : null;
   const fp  = afSanitiseKey(rawFP,  64);
   const did = afSanitiseKey(rawDID, 64);
@@ -377,9 +449,14 @@ async function checkAntiFraud(env, request, telegramId, body) {
     // بيتسجّل في fraud_logs بس عشان الأدمن يقدر يلاحظ لو بصمة معينة بقت
     // شائعة جدًا (يبقى مؤشر إن فيه حاجة غلط في جودة الـ fingerprint نفسه).
     fingerprintCommonEnvironment: false,
+    // اتفاق عدة إشارات جهاز مستقلة (مش هاش واحد مجمّع) مع نفس الحساب
+    // التاني بالتحديد — دليل قوي على نفس الجهاز الفعلي، ومستقل عن الـ
+    // IP وعن تطبيق تيليجرام المستخدَم لفتح الميني-آب. انظر afCheckSignalOverlap.
+    multiSignalDeviceMatch: false,
   };
 
   let firstOwner = null;
+  let signalOverlapOwner = null;
   const nowMs = Date.now();
 
   // ── فحص الـ Fingerprint ──────────────────────────────────────────
@@ -454,6 +531,20 @@ async function checkAntiFraud(env, request, telegramId, body) {
     } catch (_) {}
   }
 
+  // ── مطابقة الإشارات المتعددة (مستقلة تمامًا عن deviceId والـ IP) ──
+  // بتلقط حالة تعدد الحسابات من نفس الجهاز الفعلي حتى لو المستخدم فتح
+  // البوت من تطبيق تيليجرام تاني (فبيتصفّر deviceId) أو غيّر شبكته.
+  if (signals) {
+    try {
+      const overlap = await afCheckSignalOverlap(env, signals, tid);
+      if (overlap.intersectionOwner) {
+        flags.multiSignalDeviceMatch = true;
+        signalOverlapOwner = overlap.intersectionOwner;
+        if (!firstOwner) firstOwner = overlap.intersectionOwner;
+      }
+    } catch (_) {}
+  }
+
   // ── فحص سرعة إنشاء الحسابات عبر IP ──────────────────────────────
   try {
     const ipKey  = `ip_counters/${ip.replace(/\./g, '_').replace(/:/g, '-').replace(/[^a-zA-Z0-9_\-]/g, '')}`;
@@ -505,7 +596,11 @@ async function checkAntiFraud(env, request, telegramId, body) {
   // AF_FRAUD_SCORE_BLOCK. لو مطابقة فقط من غير أي دليل إضافي، بيتسجل
   // في fraud_logs ومكافآت الإحالة بتتوقف مؤقتًا، لكن الحساب نفسه
   // مايتقفلش بشكل نهائي غلط.
-  const hardBlock = flags.deviceIdReused;
+  // multiSignalDeviceMatch (اتفاق ≥3 إشارات جهاز قوية ومستقلة مع نفس
+  // الحساب التاني بالتحديد) بيتعامل معاه زي deviceIdReused — دليل قوي
+  // بنفس مستوى الثقة تقريبًا، ومصمم عشان يفضل شغال حتى لو المستخدم غيّر
+  // تطبيق تيليجرام أو الـ IP.
+  const hardBlock = flags.deviceIdReused || flags.multiSignalDeviceMatch;
   const corroboratedFpBlock = flags.fingerprintReused && score >= AF_FRAUD_SCORE_BLOCK;
 
   if (hardBlock || corroboratedFpBlock) {
@@ -515,11 +610,18 @@ async function checkAntiFraud(env, request, telegramId, body) {
         reason, reasonCode: 'multi_account', score, ts: nowMs,
         firstOwner: firstOwner || 'unknown',
         fingerprint: fp || null, deviceId: did || null,
+        signalOverlapOwner: signalOverlapOwner || null,
         flags,
       });
     } catch (_) {}
     let linkedAccounts = [];
-    try { linkedAccounts = await afGetLinkedAccounts(env, fp, did, tid); } catch (_) {}
+    try {
+      linkedAccounts = await afGetLinkedAccounts(env, fp, did, tid);
+      if (signalOverlapOwner && !linkedAccounts.some((a) => a.telegramId === signalOverlapOwner)) {
+        const u = await dbGet(env, `users/${signalOverlapOwner}`).catch(() => null);
+        if (u) linkedAccounts.push({ name: u.firstName || u.username || 'Unknown', username: u.username || '', photoUrl: u.photoUrl || '' });
+      }
+    } catch (_) {}
     return { blocked: true, referralBlocked: true, reason, reasonCode: 'multi_account', score, linkedAccounts };
   }
 
