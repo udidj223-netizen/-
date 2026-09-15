@@ -229,7 +229,9 @@ function generateAdTicket() {
 //  النبضات (مثلاً الشبكة اتقطعت) بيخلي claimAdReward يفشل برضه لكن من
 //  غير حظر — ممكن يعيد المحاولة.
 // ────────────────────────────────────────────────────────────────────
-const AD_PULSE_COUNT = 5;          // عدد النبضات المطلوبة لكل مشاهدة إعلان
+const AD_PULSE_COUNT = 5;          // أقصى عدد نبضات بيتجمع لكل مشاهدة إعلان (مش شرط تكتمل كلها)
+const AD_PULSE_MIN_REQUIRED = 1;   // أقل عدد نبضات مقبول عند المطالبة — إعلانات قصيرة (أقل من adMinWatchMs)
+                                    // ممكن متلحقش تجمع 5 نبضات كاملة، فبنقبل أي عدد حقيقي ولو نبضة واحدة
 const AD_PULSE_MIN_GAP_MS = 1200;  // أقل فاصل مسموح بين نبضتين (يمنع النداء الفوري المتكرر)
 const AD_PULSE_MAX_GAP_MS = 6000;  // أكتر فاصل مسموح قبل ما نعتبر السلسلة "باظت"
 
@@ -2092,28 +2094,35 @@ async function handleClaimAdReward(env, ctx) {
   }
 
   // ── الحد الأدنى للوقت بين بداية الإعلان والمطالبة بالمكافأة ──────────
-  // لو الطلب وصل أسرع من adMinWatchMs من وقت /checkSession، ده مستحيل
-  // يبقى فيه إعلان حقيقي اتشاف في المدة دي.
+  // لو الطلب وصل أسرع من adMinWatchMs من وقت /checkSession، معناها
+  // الإعلان اتقفل بدري (سواء المستخدم قفله فعلًا أو الإعلان نفسه كان
+  // قصير من الأساس). ده مش دليل تلاعب في حد ذاته — فبنرجّع فشل عادي
+  // برسالة واضحة للمستخدم بدل ما نحظر الحساب، وهو يقدر يعيد المحاولة
+  // بإعلان تاني.
   const minWatchMs = Math.max(0, Number(config.adMinWatchMs ?? DEFAULT_CONFIG.adMinWatchMs ?? 5000));
   if (minWatchMs > 0 && Date.now() - record.issuedAt < minWatchMs) {
-    return blockAccountForPulseFraud(env, user.telegramId, 'ad_watch_too_fast');
+    const minWatchSeconds = Math.ceil(minWatchMs / 1000);
+    return fail(`Please stay on the ad for at least ${minWatchSeconds} seconds to earn the reward`, 400);
   }
 
   // ── التحقق من سلسلة النبضات (chk) اللي اتجمعت أثناء المشاهدة ─────────
-  // الكلاينت لازم يرفق نفس الـ AD_PULSE_COUNT كود اللي استلمهم من
-  // /sessionSync بالظبط وبنفس الترتيب، بالإضافة للتيكيت الأساسي وطابع
-  // زمني (ct). أي نقص أو قيمة غلط أو مكررة = حظر فوري.
+  // الكلاينت بيرفق كل الأكواد اللي فعلًا استلمها من /sessionSync بالظبط
+  // وبنفس الترتيب، بالإضافة للتيكيت الأساسي وطابع زمني (ct). العدد نفسه
+  // مش لازم يبقى ثابت (AD_PULSE_COUNT) — إعلانات أقصر من 5 ثواني ممكن
+  // منطقيًا متلحقش تجمع كل النبضات، فبنقبل أي عدد حقيقي بدءًا من
+  // AD_PULSE_MIN_REQUIRED. لكن أي قيمة غلط أو مكررة أو عدد أكبر مما
+  // اتجمع فعلًا = دليل تلاعب واضح فالحساب يتحظر فورًا.
   const pulses = record.pulses || [];
   const chk = Array.isArray(body.chk) ? body.chk.map((v) => String(v || '')) : [];
   const clientTs = Number(body.ct);
 
-  if (pulses.length < AD_PULSE_COUNT) {
+  if (pulses.length < AD_PULSE_MIN_REQUIRED) {
     return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_incomplete');
   }
   if (!Number.isFinite(clientTs)) {
     return blockAccountForPulseFraud(env, user.telegramId, 'ad_claim_malformed');
   }
-  if (chk.length !== AD_PULSE_COUNT) {
+  if (chk.length < AD_PULSE_MIN_REQUIRED || chk.length > pulses.length) {
     return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_claim_length');
   }
   const uniqueChk = new Set(chk);
@@ -2121,7 +2130,7 @@ async function handleClaimAdReward(env, ctx) {
     // قيم مكررة داخل نفس الطلب — مش ممكن يحصل مع نداءات حقيقية متتالية
     return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_claim_duplicate');
   }
-  for (let i = 0; i < AD_PULSE_COUNT; i++) {
+  for (let i = 0; i < chk.length; i++) {
     if (chk[i] !== pulses[i].code) {
       return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_claim_mismatch');
     }
