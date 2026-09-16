@@ -2869,7 +2869,7 @@ async function handleGetReferrals(env, ctx) {
 // تنبيه: في حال الرفض، الرصيد لا يُرجع تلقائيًا — يجب إرجاعه يدويًا عبر
 // تعديل users/{telegramId}/balance في Firebase إذا تقرر رفض الطلب.
 async function handleRequestWithdrawal(env, ctx) {
-  const { user, body, config } = ctx;
+  const { user, body, config, botToken } = ctx;
   const telegramId = user.telegramId;
 
   if (config.withdrawalEnabled === false) {
@@ -2959,6 +2959,27 @@ async function handleRequestWithdrawal(env, ctx) {
     withdrawalId,
     ts: Date.now(),
   });
+
+  // ── إشعار المستخدم عبر البوت بإنشاء طلب السحب ───────────────────────
+  // رسالة إعلامية فقط (لا تؤثر على نتيجة الطلب حتى لو فشل الإرسال —
+  // sendTelegramMessage نفسها بتبتلع أي خطأ شبكة/توكن من غير ما توقف
+  // باقي الكود، فالسحب بيتسجل بنجاح في كل الأحوال).
+  const displayName = user.username
+    ? `@${user.username}`
+    : (user.firstName || String(telegramId));
+  const withdrawalNotifyMessage =
+    `💸 Withdrawal Request Submitted Successfully! ✅\n\n` +
+    `👤 Name: ${displayName}\n` +
+    `🆔 Account ID: "${telegramId}"\n` +
+    `💳 Wallet Address:\n"${walletAddress}"\n\n` +
+    `━━━━━━━━━━━━━━━\n\n` +
+    `💰 Amount: "${amount}" TON\n` +
+    `📌 Status: 🟡 Processing\n\n` +
+    `⏳ Estimated Arrival:\n` +
+    `Your withdrawal will be processed and sent to your wallet within 24–72 hours.\n\n` +
+    `💜 Thank you for using PMT Gram\n` +
+    `━━━━━━━━━━━━━━━`;
+  await sendTelegramMessage(env, botToken || config.botToken || '', telegramId, withdrawalNotifyMessage);
 
   return ok({
     tonBalance: newBalance,
