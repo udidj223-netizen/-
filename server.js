@@ -73,7 +73,6 @@ const DEFAULT_CONFIG = {
   // ولو الشركة غير موجودة، يتم استخدام adReward و adCompanyDailyLimit
   // كقيمة احتياطية أعلاه.
   adCompanies: {
-    monetag: { reward: 200, dailyLimit: 10 },
     adsgram: { reward: 200, dailyLimit: 10 },
     gigapub: { reward: 200, dailyLimit: 10 },
     monetix: { reward: 200, dailyLimit: 10 },
@@ -225,9 +224,9 @@ function generateAdTicket() {
 //  بتتبادل فعليًا بين الطرفين طول مدة المشاهدة. عند /claimAdReward
 //  لازم يترفق نفس الـ 5 أكواد اللي استلمها بالترتيب — أي قيمة غلط أو
 //  متكررة معناها التسلسل اتلعب فيه (سكريبت بيولّد/يعيد قيم من عنده
-//  بدل ما يتبع النداءات الحقيقية) فالحساب يتحظر فورًا. أي نقص في عدد
-//  النبضات (مثلاً الشبكة اتقطعت) بيخلي claimAdReward يفشل برضه لكن من
-//  غير حظر — ممكن يعيد المحاولة.
+//  بدل ما يتبع النداءات الحقيقية) فالطلب يترفض فورًا (بدون حظر الحساب).
+//  أي نقص في عدد النبضات (مثلاً الشبكة اتقطعت) بيخلي claimAdReward يفشل
+//  برضه من غير حظر — ممكن يعيد المحاولة بمشاهدة إعلان جديد.
 // ────────────────────────────────────────────────────────────────────
 const AD_PULSE_COUNT = 5;          // أقصى عدد نبضات بيتجمع لكل مشاهدة إعلان (مش شرط تكتمل كلها)
 const AD_PULSE_MIN_REQUIRED = 1;   // أقل عدد نبضات مقبول عند المطالبة — إعلانات قصيرة (أقل من adMinWatchMs)
@@ -240,16 +239,11 @@ function generatePulseCode() {
   return bufferToHex(bytes.buffer);
 }
 
-// حظر فوري لحساب ثبت تلاعبه بسلسلة النبضات — نفس شكل الحظر المستخدم في
-// نظام مكافحة الاحتيال العام (blocked_accounts/{telegramId}).
-async function blockAccountForPulseFraud(env, telegramId, reasonCode) {
-  const reason = 'Suspicious activity detected while verifying ad view. This account has been banned from using the bot.';
-  try {
-    await dbUpdate(env, `blocked_accounts/${telegramId}`, {
-      reason, reasonCode: reasonCode || 'ad_pulse_fraud', ts: Date.now(),
-    });
-  } catch (_) {}
-  return failBlocked(reason, reasonCode || 'ad_pulse_fraud', []);
+// رفض عادي (بدون حظر) لأي خطأ في التحقق من سلسلة النبضات أثناء مشاهدة
+// الإعلان. الحساب لا يُحظر تلقائيًا أبدًا هنا — فقط يترفض الطلب الحالي
+// برسالة واضحة، والمستخدم يقدر يعيد المحاولة بمشاهدة إعلان جديد من البداية.
+function rejectAdPulseError(env, telegramId, reasonCode) {
+  return fail('Ad verification failed. Please watch the ad again from the start.', 400);
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1245,37 +1239,33 @@ async function findUserByReferralCode(env, code) {
 // تُقرأ من Firebase تحت config/adCompanies/<company>/{reward, dailyLimit}
 // ولو مش موجودة، بترجع للقيم الاحتياطية config/adReward و config/adCompanyDailyLimit.
 //
-// ملاحظة مهمة (إصلاح مشكلة "monetag" اللي كانت بتفضل تاخد قيمة افتراضية
-// 200 مهما غيّرت الإعدادات): سبب المشكلة كان إن نود الشركة في Firebase
-// كان مكتوب بالغلط "montag" بدل "monetag"، فالكود كان بيدور بالظبط على
-// المفتاح "monetag" ومبيلاقيهوش، فيرجع تلقائيًا للقيمة الاحتياطية جوه
-// الكود. عشان المشكلة دي متتكررش تاني مع أي خطأ إملائي أو اختلاف حالة
-// أحرف (case) في اسم النود، الدالة بقت بتدور بمرونة أكتر:
-//   1) المفتاح الصحيح بالظبط (company).
-//   2) أي alias معروف للشركة دي (زي "montag" كـ alias قديم لـ "monetag").
-//   3) مطابقة غير حساسة لحالة الأحرف/المسافات الزايدة مع كل مفاتيح
-//      config.adCompanies الموجودة فعليًا في Firebase.
-// لو حابب تضيف شركة إعلانات جديدة، أضف اسمها في COMPANY_ALIASES تحت.
+// شركات الإعلانات المسموح بها حصريًا (نفس الـ3 شركات المستخدمة فعليًا في
+// الواجهة الأمامية: Adsgram / GigaPub / Monetix). أي اسم شركة تاني بييجي
+// في الطلب (بما فيه "monetag" القديمة اللي اتشالت بالكامل) يترفض فورًا
+// من canonicalAdCompany (بيرجع null) بدل ما ياخد قيمة افتراضية زي الأول.
+// لو حابب تضيف شركة إعلانات جديدة مستقبلًا، أضف اسمها هنا في
+// COMPANY_ALIASES وفي DEFAULT_CONFIG.adCompanies فوق.
 const COMPANY_ALIASES = {
-  monetag: ['monetag', 'montag'], // "montag" كان الخطأ الإملائي اللي سبب المشكلة
   adsgram: ['adsgram'],
   gigapub: ['gigapub', 'giga', 'gigapub.tech'],
   monetix: ['monetix', 'monetixads'],
 };
 
+// يرجّع الاسم الموحّد للشركة لو كانت واحدة من الشركات المسموح بها فقط،
+// وإلا يرجّع null (الاستدعاء المسؤول لازم يتعامل مع null كطلب مرفوض).
 function canonicalAdCompany(company) {
   const normalized = String(company || '').trim().toLowerCase();
-  if (normalized === 'adsgram') return 'adsgram';
-  if (normalized === 'monetag' || normalized === 'montag') return 'monetag';
-  if (COMPANY_ALIASES.gigapub.includes(normalized)) return 'gigapub';
-  if (COMPANY_ALIASES.monetix.includes(normalized)) return 'monetix';
-  return 'monetag';
+  for (const [canonical, aliases] of Object.entries(COMPANY_ALIASES)) {
+    if (aliases.includes(normalized)) return canonical;
+  }
+  return null;
 }
 
 function findCompanyNode(adCompanies, company) {
   if (!adCompanies) return {};
 
   const canonical = canonicalAdCompany(company);
+  if (!canonical) return {};
   const aliases = COMPANY_ALIASES[canonical] || [canonical];
   // 1) تطابق مباشر بالاسم الموحد
   if (adCompanies[canonical]) return adCompanies[canonical];
@@ -1299,6 +1289,7 @@ function findCompanyNode(adCompanies, company) {
 
 function getAdCompanyConfig(config, company) {
   const canonical = canonicalAdCompany(company);
+  if (!canonical) return { reward: 0, dailyLimit: 0 };
   const perCompany = findCompanyNode(config.adCompanies, canonical);
   const rewardValue = Number(
     perCompany.reward ?? config.adReward ?? DEFAULT_CONFIG.adReward
@@ -1323,14 +1314,13 @@ function normalizeAdWatchCounters(rawCounters, legacyTotal = 0) {
   if (rawCounters && typeof rawCounters === 'object') {
     for (const [key, value] of Object.entries(rawCounters)) {
       const canonical = canonicalAdCompany(key);
+      // شركات غير معروفة (زي "monetag" القديمة اللي اتشالت بالكامل) بيتم
+      // تجاهلها هنا — عدادها القديم في قاعدة البيانات مش بيتحسب تاني ولا
+      // بيتحول لأي شركة تانية.
+      if (!canonical) continue;
       const count = Math.max(0, Number(value || 0));
       result[canonical] = Math.max(result[canonical] || 0, count);
     }
-  }
-  // users created before per-company counters existed had only this field.
-  // Keep the old behavior as a safe migration path instead of losing progress.
-  if (!Object.keys(result).length && Number(legacyTotal || 0) > 0) {
-    result.monetag = Math.max(0, Number(legacyTotal || 0));
   }
   return result;
 }
@@ -1344,7 +1334,6 @@ function totalAdWatchCounters(counters) {
 function getAllAdCompaniesConfig(config) {
   const known = new Set([
     ...Object.keys(DEFAULT_CONFIG.adCompanies || {}),
-    'monetag',
     'adsgram',
     'gigapub',
     'monetix',
@@ -1854,7 +1843,7 @@ async function handleGetState(env, ctx) {
     stats: {
       adsWatchedToday,
       adsWatchedByCompany: adsByCompany,
-      adCompanies: adCompaniesConfig,   // { monetag: {reward, dailyLimit}, adsgram: {...}, ... } لكل شركة
+      adCompanies: adCompaniesConfig,   // { adsgram: {reward, dailyLimit}, gigapub: {...}, monetix: {...} } لكل شركة
       adCompanyDailyLimit,
       adDailyTotalLimit: Number(config.adDailyLimit ?? DEFAULT_CONFIG.adDailyLimit),
       statsDate: today,
@@ -1963,6 +1952,11 @@ async function handleRedeemCode(env, ctx) {
 async function handleStartAdView(env, ctx) {
   const { user, config, body } = ctx;
   const company = canonicalAdCompany(body.company);
+  // أي اسم شركة غير Adsgram/GigaPub/Monetix يترفض فورًا (لا يُعطى أي
+  // قيمة افتراضية زي ما كان بيحصل قبل كده مع monetag).
+  if (!company) {
+    return fail('Unsupported ad company');
+  }
   const companyConfig = getAdCompanyConfig(config, company);
 
   // فحص مبدئي للحدود اليومية (نفس فحص claimAdReward) — مجرد رفض مبكر
@@ -2034,13 +2028,13 @@ async function handleSessionSync(env, ctx) {
   // أول نداء: مفيش p سابق. أي نداء بعد كده لازم يرجّع بالظبط آخر كود
   // اتصدر — أي قيمة تانية (سواء فاضية أو غلط أو كود قديم اتكرر) دليل
   // واضح إن في سكريبت بيحاول يخمن/يعيد التسلسل من غير ما يتبع النداءات
-  // الحقيقية بترتيبها، فالحساب يتحظر فورًا.
+  // الحقيقية بترتيبها، فالطلب يترفض فورًا (بدون حظر الحساب).
   if (pulses.length === 0) {
     if (prev) {
-      return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_unexpected');
+      return rejectAdPulseError(env, user.telegramId, 'ad_pulse_unexpected');
     }
   } else if (prev !== lastCode) {
-    return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_mismatch');
+    return rejectAdPulseError(env, user.telegramId, 'ad_pulse_mismatch');
   }
 
   const now = Date.now();
@@ -2063,34 +2057,39 @@ async function handleSessionSync(env, ctx) {
 async function handleClaimAdReward(env, ctx) {
   const { user, config, body } = ctx;
   const company = canonicalAdCompany(body.company);
+  // نفس القيد الموجود في /startAdView: أي شركة غير الثلاث المسموح بها
+  // (Adsgram/GigaPub/Monetix) يترفض طلبها هنا فورًا.
+  if (!company) {
+    return fail('Unsupported ad company');
+  }
 
   // ── التحقق من تذكرة مشاهدة الإعلان (sid) ────────────────────────
   // لازم تكون اتولّدت من /checkSession قبل كده لنفس telegramId/الشركة/بصمة
   // الجهاز، ولسه صالحة (متعدتش AD_NONCE_TTL_MS)، ومتستخدمتش قبل كده.
   // من هنا لحد النهاية: أي خطأ في البيانات المُرسلة (تذكرة غلط/منتهية/
-  // مش مطابقة، وقت مشاهدة مستحيل، أكواد نبض غلط أو ناقصة) = حظر فوري
-  // للحساب — مفيش "فشل عادي يقدر يعيد المحاولة" في المسار ده، أي انحراف
-  // عن البروتوكول الطبيعي بيتعامل معاه كدليل تلاعب.
+  // مش مطابقة، وقت مشاهدة مستحيل، أكواد نبض غلط أو ناقصة) = رفض الطلب
+  // الحالي فقط (بدون حظر الحساب) — المستخدم يقدر يعيد المحاولة بمشاهدة
+  // إعلان جديد من البداية.
   cleanupExpiredAdNonces();
   const ticket = String(body.sid || '');
   const record = ticket ? adNonceStore.get(ticket) : null;
   const fp = afSanitiseKey(body._deviceFingerprint, 64) || 'missing';
 
   if (!record) {
-    return blockAccountForPulseFraud(env, user.telegramId, 'ad_ticket_missing');
+    return rejectAdPulseError(env, user.telegramId, 'ad_ticket_missing');
   }
   if (record.claiming) {
     // نفس التذكرة مستخدمة حاليًا في طلب تاني شغال (منع إعادة الاستخدام
     // المتزامن/Race Condition) — مش خطأ عادي، ده مؤشر تلاعب واضح.
-    return blockAccountForPulseFraud(env, user.telegramId, 'ad_ticket_concurrent');
+    return rejectAdPulseError(env, user.telegramId, 'ad_ticket_concurrent');
   }
   if (record.expireAt < Date.now()) {
     adNonceStore.delete(ticket);
-    return blockAccountForPulseFraud(env, user.telegramId, 'ad_ticket_expired');
+    return rejectAdPulseError(env, user.telegramId, 'ad_ticket_expired');
   }
   if (record.telegramId !== String(user.telegramId) || record.company !== company || record.fingerprint !== fp) {
     // التذكرة موجودة لكن مش لنفس المستخدم/الشركة/الجهاز اللي اتولّدت له
-    return blockAccountForPulseFraud(env, user.telegramId, 'ad_ticket_mismatch');
+    return rejectAdPulseError(env, user.telegramId, 'ad_ticket_mismatch');
   }
 
   // ── الحد الأدنى للوقت بين بداية الإعلان والمطالبة بالمكافأة ──────────
@@ -2111,28 +2110,28 @@ async function handleClaimAdReward(env, ctx) {
   // مش لازم يبقى ثابت (AD_PULSE_COUNT) — إعلانات أقصر من 5 ثواني ممكن
   // منطقيًا متلحقش تجمع كل النبضات، فبنقبل أي عدد حقيقي بدءًا من
   // AD_PULSE_MIN_REQUIRED. لكن أي قيمة غلط أو مكررة أو عدد أكبر مما
-  // اتجمع فعلًا = دليل تلاعب واضح فالحساب يتحظر فورًا.
+  // اتجمع فعلًا = دليل تلاعب واضح فالطلب يترفض فورًا (بدون حظر الحساب).
   const pulses = record.pulses || [];
   const chk = Array.isArray(body.chk) ? body.chk.map((v) => String(v || '')) : [];
   const clientTs = Number(body.ct);
 
   if (pulses.length < AD_PULSE_MIN_REQUIRED) {
-    return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_incomplete');
+    return rejectAdPulseError(env, user.telegramId, 'ad_pulse_incomplete');
   }
   if (!Number.isFinite(clientTs)) {
-    return blockAccountForPulseFraud(env, user.telegramId, 'ad_claim_malformed');
+    return rejectAdPulseError(env, user.telegramId, 'ad_claim_malformed');
   }
   if (chk.length < AD_PULSE_MIN_REQUIRED || chk.length > pulses.length) {
-    return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_claim_length');
+    return rejectAdPulseError(env, user.telegramId, 'ad_pulse_claim_length');
   }
   const uniqueChk = new Set(chk);
   if (uniqueChk.size !== chk.length) {
     // قيم مكررة داخل نفس الطلب — مش ممكن يحصل مع نداءات حقيقية متتالية
-    return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_claim_duplicate');
+    return rejectAdPulseError(env, user.telegramId, 'ad_pulse_claim_duplicate');
   }
   for (let i = 0; i < chk.length; i++) {
     if (chk[i] !== pulses[i].code) {
-      return blockAccountForPulseFraud(env, user.telegramId, 'ad_pulse_claim_mismatch');
+      return rejectAdPulseError(env, user.telegramId, 'ad_pulse_claim_mismatch');
     }
   }
 
@@ -2217,7 +2216,7 @@ async function handleClaimAdReward(env, ctx) {
 }
 
 // ───────────────────────── Mining session ─────────────────────────
-// مشاهدة إعلان Monetag تفتح جلسة تعدين واحدة. الرصيد لا يُحتسب من
+// مشاهدة إعلان تفتح جلسة تعدين واحدة. الرصيد لا يُحتسب من
 // الواجهة: السيرفر يحسبه من وقت البداية، ولا يسمح بالمطالبة قبل ساعة.
 async function handleStartMining(env, ctx) {
   const { user, config } = ctx;
@@ -2895,7 +2894,7 @@ async function handleRequestWithdrawal(env, ctx) {
     ? normalizeAdWatchCounters(freshUser.adsWatchedByCompany, freshUser.adsWatchedToday)
     : {};
   // شرط السحب بيعتمد فقط على عدد إعلانات Adsgram (الشركات التانية زي
-  // monetag و gigapub بتفضل تدي مكافأة عادية للمستخدم، لكن مبتتحسبش في
+  // gigapub و monetix بتفضل تدي مكافأة عادية للمستخدم، لكن مبتتحسبش في
   // شرط عدد الإعلانات المطلوب قبل السحب)
   const watchedAds = Number(adsByCompanyToday.adsgram || 0);
   const previousWithdrawals = await dbGet(env, `withdrawals/${telegramId}`);
